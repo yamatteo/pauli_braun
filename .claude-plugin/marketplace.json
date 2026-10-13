@@ -1,0 +1,6 @@
+{
+  "name": "pauli-braun",
+  "description": "The pauli-braun plugin: a single-thread Pauli (plan & review) / Braun (build) workflow for Claude Code.",
+  "owner": { "name": "yamatteo" },
+  "plugins": [{ "name": "pauli-braun", "source": "./" }]
+}
