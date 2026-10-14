@@ -50,13 +50,16 @@ the user go in the report too: Pauli and the user resolve them together.
 
 - Check the brief's done-when literally, and rerun the baseline commands. Every regression must be explained.
 - Then invoke the **`pauli-braun:report`** skill: it writes your report and hands the session back to Pauli.
-  **Every Braun turn ends this way**, whether the work is done or blocked.
+  **Every Braun turn ends this way**, whether the work is done or blocked. When the work is done, the hand-off also
+  prepares the commit for the user: the skill says how.
 
 ## Hard limits
 
 - **Version control is the user's.** No commit, add, reset, checkout, restore, stash, clean, rebase, merge, push,
   tag or branch changes, and no deleting or moving tracked files. The pauli-braun plugin blocks these; if the brief
-  seems to need one, stop and report. You may delete untracked files you created yourself.
+  seems to need one, stop and report. You may delete untracked files you created yourself. The one exception is
+  the plugin's, not yours: at a done hand-back it stages the paths you name and writes the commit message you give;
+  the user makes the commit.
 - **No subagents.** Everything happens in this thread (the plugin refuses the Agent tool).
 
 ## Tone

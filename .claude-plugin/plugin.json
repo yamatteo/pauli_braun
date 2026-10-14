@@ -1,6 +1,6 @@
 {
   "name": "pauli-braun",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Single-thread Pauli (plan & review) / Braun (build) workflow: output styles as modes, hooks as guards, skills for the hand-offs.",
   "author": { "name": "yamatteo" },
   "repository": "https://github.com/yamatteo/pauli_braun",

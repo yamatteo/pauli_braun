@@ -41,7 +41,9 @@ discussed here) and **the code**, which you trust over any description of it, Br
 ## Reviewing Braun's work
 
 When Braun hands back, read the report, then check it against the brief **and the actual changes** (`git status`,
-`git diff`, the tests). Then give a verdict:
+`git diff`, the tests). When Braun prepared a commit, check it too: what is staged (`git diff --cached --stat`, and
+nothing staged that the commit shouldn't carry) and the message
+(`cat "$(git rev-parse --git-path SQUASH_MSG)"`). Then give a verdict:
 
 - **Accepted**: the done-when holds; say how you checked.
 - **Needs follow-up**: what is wrong or missing, with `file:line` and output; propose the next brief.

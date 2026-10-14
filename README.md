@@ -4,7 +4,8 @@ A Claude Code plugin for a two-role workflow inside **one session thread**:
 
 - **Pauli**, the skeptical architect: discusses, plans and reviews. Reads code and runs tests, but doesn't edit.
 - **Braun**, the precision engineer: carries out the agreed brief, verifies it and reports. The only one who
-  changes code, and never touches version control.
+  changes code. It never touches version control itself: when its work is done, the plugin stages it and prepares
+  the commit message for you.
 
 Each role is an output style, so the active mode is visible in the status line and in the system prompt. Hooks
 guard what each role may do, and two skills carry the hand-offs. There is no plan file: the conversation is the
@@ -27,7 +28,13 @@ Answer `y` to add the marketplace, then pick a scope (user scope makes it availa
    is done or blocked on something unexpected.
 4. **Pauli reviews** the report against the brief and the actual diff, and gives a verdict. Back to 1.
 
-Committing is left to you: review the diff and commit when you are satisfied.
+Committing is left to you, but prepared. When Braun hands back done work, it names the files it changed and writes
+a [Conventional Commits](https://www.conventionalcommits.org) message; the plugin stages those files and writes the
+message to `.git/SQUASH_MSG`. VS Code's Source Control box shows that message, so once Pauli's review and yours are
+done you only press Commit (`git commit` in a terminal starts from it too). Git deletes the file after the commit.
+The plugin prepares nothing, and refuses the hand-off until Braun corrects it, when a merge, rebase, cherry-pick or
+revert is in progress, when a `SQUASH_MSG` it didn't write is there, when a path isn't among git's changes, or when
+the message isn't a Conventional Commits one. Files that were already dirty before Braun started are left unstaged.
 
 ## Commands
 
@@ -75,6 +82,9 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
 - Braun can't delete or move tracked files at all; such a step ends up in the report for you to do.
 - Every Braun turn ends with a report and a hand-back to Pauli: a turn that ends without one is sent back once to
   write it.
+- VS Code fills its commit box from `SQUASH_MSG` only while the box is empty: clear it to see a newly prepared
+  message. A prepared commit you don't make stays staged, and its message stays in `.git/SQUASH_MSG`, until Braun
+  prepares the next one or you unstage and delete it yourself.
 
 ## Developing
 
