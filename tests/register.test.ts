@@ -1,4 +1,4 @@
-import type { On } from 'claude-code'
+import type { AgentStatus, On } from 'claude-code'
 import { type Engine, expect, mock, test } from 'claude-code/testing'
 
 const AGENT = 'pauli-braun:braun'
@@ -6,10 +6,10 @@ const WRITE_NEW = { tool: 'Write', file_path: '/repo/new.txt', content: 'x' } as
 
 /**
  * The engine beneath the plugin: a repository at /repo with nothing untracked or ignored, slash commands that just
- * run, tool calls that succeed, and `agents` as the session's agent list. Returns what was submitted as prompts, and
- * the toasts shown.
+ * run, tool calls that succeed, and `agents` as the session's agent list (each `running` unless it says otherwise).
+ * Returns what was submitted as prompts, and the toasts shown.
  */
-function world(on: On, agents: { id: string; type: string }[] = []) {
+function world(on: On, agents: { id: string; type: string; status?: AgentStatus }[] = []) {
   const prompts: string[] = []
   const toasts: string[] = []
   const clock = mock.clock(on)
@@ -20,7 +20,7 @@ function world(on: On, agents: { id: string; type: string }[] = []) {
   on('session.cwd', () => ({ value: '/repo' }))
   on('command.run', () => ({ text: 'ran' }) as never)
   on('prompt.submit', (_$, e) => (prompts.push(e.text), { text: e.text }) as never)
-  on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', status: 'running' as const })) }))
+  on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', status: a.status ?? 'running' })) }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('process.run', (_$, e) => {
@@ -98,6 +98,31 @@ test('the run is recorded only once the session has switched to Braun', async ($
 const DELEGATE = { tool: 'mcp__pauli-braun__delegate' } as const
 const BRAUN_CALL = { tool: 'Agent', subagent_type: AGENT, description: 'Braun: add new.txt', prompt: 'Brief for Braun: add new.txt' } as const
 
+/** A subagent's turn, from its start to its end. */
+async function subagentTurnEnds($: Engine, agentId: string) {
+  await $.turn.start({ text: 'brief', turnId: `${agentId}-t`, agentId } as never)
+  await $.turn.complete({ answer: 'report', turnId: `${agentId}-t`, durationMs: 1, isAborted: false, reason: 'answer', agentId } as never)
+}
+
+/**
+ * Pauli's turn that delegates: /delegate, the delegate tool, and the Agent call, which spawns subagent `a1` in the
+ * background and returns at once, as the engine does.
+ */
+async function delegateInBackground($: Engine, on: On, turnId = 'p1') {
+  on('agent.spawn', () => ({ model: 'm', agentId: 'a1' }))
+  on('tool.call', async (_$, e) => {
+    if (e.tool !== 'Agent') return { result: 'ok' }
+    await $.agent.spawn({ prompt: 'Brief for Braun: add new.txt', subagentType: AGENT, background: true } as never)
+    return { result: 'Async agent launched successfully.' }
+  })
+  await command($, 'output-style', 'pauli-braun:pauli')
+  await command($, 'delegate')
+  await $.turn.start({ text: 'brief', turnId } as never)
+  expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
+  expect(denied(await $.tool.call(BRAUN_CALL as never))).toBeUndefined()
+  await $.turn.complete({ answer: 'Delegating', turnId, durationMs: 1, isAborted: false, reason: 'answer' } as never)
+}
+
 test('delegating needs /delegate and Pauli mode', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
@@ -150,7 +175,8 @@ test('a delegated Braun works under Braun\'s rules, and its report comes back to
   expect(seen.git).toContain('.git')
   expect(seen.handBack).toContain('hands back to Pauli only')
 
-  // Once the Agent call has returned, the subagent's run is over, and so is the delegation.
+  // Once the subagent's turn has ended, its run is over, and so is the delegation.
+  await subagentTurnEnds($, 'a1')
   expect(denied(await $.tool.call({ ...WRITE_NEW, agentId: 'a1' } as never))).toContain('there is no Braun run')
   expect(denied(await $.tool.call(BRAUN_CALL as never))).toContain('/delegate')
 })
@@ -172,25 +198,59 @@ test('the Agent call for Braun needs an open delegation, and runs once', async (
   expect(runs).toBe(1)
 })
 
-test('a delegated Braun runs in the foreground, whatever the Agent call asks', async ($, on) => {
-  world(on)
-  const backgrounds: boolean[] = []
-  on('agent.spawn', (_$, e) => (backgrounds.push(e.background), { model: 'm', agentId: 'a1' }))
-  on('tool.call', async (_$, e) => {
-    if (e.tool !== 'Agent') return { result: 'ok' }
-    // The engine spawns the subagent as the call asked: here, in the background.
-    await $.agent.spawn({ prompt: 'go', subagentType: AGENT, background: true } as never)
-    return { result: 'report' }
-  })
-  await command($, 'output-style', 'pauli-braun:pauli')
+test('a background Braun keeps its run after the Agent call and Pauli\'s turn, until its own turn ends', async ($, on) => {
+  world(on, [{ id: 'a1', type: AGENT }])
+  await delegateInBackground($, on)
 
-  // Without the field, and with it as a model may send it when the Agent tool doesn't define it.
-  for (const call of [BRAUN_CALL, { ...BRAUN_CALL, run_in_background: 'false' }, { ...BRAUN_CALL, run_in_background: true }]) {
-    await command($, 'delegate')
-    expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
-    expect(denied(await $.tool.call(call as never))).toBeUndefined()
-  }
-  expect(backgrounds).toEqual([false, false, false])
+  // The Agent call has returned and Pauli's turn is over: the subagent still writes as Braun.
+  expect(denied(await $.tool.call({ ...WRITE_NEW, agentId: 'a1' } as never))).toBeUndefined()
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/.git/HEAD', content: 'x', agentId: 'a1' } as never))).toContain('.git')
+
+  // Its turn ends: so do its run and the delegation, and a new /delegate may open one.
+  await subagentTurnEnds($, 'a1')
+  expect(denied(await $.tool.call({ ...WRITE_NEW, agentId: 'a1' } as never))).toContain('there is no Braun run')
+  await command($, 'delegate')
+  expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
+})
+
+test('a delegated Braun that ended without its turn\'s end doesn\'t block the next /delegate', async ($, on) => {
+  const agents: { id: string; type: string; status?: AgentStatus }[] = [{ id: 'a1', type: AGENT }]
+  world(on, agents)
+  await delegateInBackground($, on)
+
+  // While it runs, a second delegation is refused.
+  await command($, 'delegate')
+  expect(denied(await $.tool.call(DELEGATE as never))).toContain('already working')
+
+  // Killed: the delegation is found over, and cleared.
+  agents[0]!.status = 'killed'
+  expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
+})
+
+test('a /handoff to Braun is refused while a delegated Braun is working', async ($, on) => {
+  const agents: { id: string; type: string; status?: AgentStatus }[] = [{ id: 'a1', type: AGENT }]
+  world(on, agents)
+  await delegateInBackground($, on)
+
+  await command($, 'handoff')
+  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toContain('still working')
+
+  // Once the subagent is gone from the agent list, the hand-off goes through.
+  agents.splice(0)
+  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
+})
+
+test('an Agent call that spawns no subagent leaves no delegation behind', async ($, on) => {
+  world(on)
+  on('tool.call', () => ({ result: 'interrupted' }))
+  await command($, 'output-style', 'pauli-braun:pauli')
+  await command($, 'delegate')
+  expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
+  expect(denied(await $.tool.call(BRAUN_CALL as never))).toBeUndefined()
+
+  // Within the same turn, the delegation is already over: a new one may open.
+  await command($, 'delegate')
+  expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
 })
 
 test('a delegation the Agent call never claims ends with Pauli\'s turn', async ($, on) => {

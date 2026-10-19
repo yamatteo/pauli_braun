@@ -28,9 +28,9 @@ Answer `y` to add the marketplace, then pick a scope (user scope makes it availa
    its own. This is the only way to start Braun, and it needs a git repository: Braun's defaults are what git can
    restore.
    Or **`/delegate [notes]`**: Pauli writes a longer, self-contained brief straight into a Braun subagent, which it
-   runs in the foreground and waits for (in the thread there is one line, `Delegating: <goal>`).
+   runs in the background (in the thread there is one line, `Delegating: <goal>`).
 3. **Braun builds**, checks the done-when, writes a *report* and hands back to Pauli automatically, whether the work
-   is done or blocked on something unexpected. A delegated Braun's report is what Pauli's Agent call returns.
+   is done or blocked on something unexpected. A delegated Braun's report comes back to Pauli as its hand-back message.
 4. **Pauli reviews** the report against the brief and the actual diff, and gives a verdict. Back to 1.
 
 `/handoff` and `/delegate` are the only ways to start Braun: the plugin refuses a hand-off or a delegation the
@@ -99,11 +99,13 @@ its untracked files at that moment, and the brief's **Allowed beyond the default
   mode change. Switching to Braun's style by hand starts no run, and every write is then refused ("start Braun
   with /handoff or /delegate").
 - Delegated, the delegate tool opens the delegation and measures its run; Pauli then makes one Agent call for the
-  Braun subagent, which the plugin forces into the foreground, whatever the call's `run_in_background`. Any other
-  Agent call for Braun is refused. The run belongs to that one subagent: the plugin applies Braun's rules to the
-  subagent's calls, and the run ends when the Agent call returns, when the subagent's turn ends, or at the latest
-  when Pauli's turn ends (which also ends a delegation the Agent call never claimed). The subagent prepares its
-  commit through the hand-off tool, which then only stages and writes the message.
+  Braun subagent, which runs in the background. Any other Agent call for Braun is refused. The run belongs to that
+  one subagent: the plugin applies Braun's rules to the subagent's calls, and the run ends when the subagent's turn
+  ends, or when the plugin finds the subagent ended (completed, failed, killed or gone) without that turn's end
+  reaching it. A delegation that spawned no subagent ends when the Agent call returns, or at the latest when Pauli's
+  turn ends (which also ends one the Agent call never claimed). While a delegated Braun is working, a second
+  `/delegate` and a `/handoff` to Braun are refused. The subagent prepares its commit through the hand-off tool,
+  which then only stages and writes the message.
 
 Within a run, Braun may change what can be recovered. The plugin checks each path a command writes or removes
 (file edits; redirections, `tee`, `sed -i`, `perl -i`, `cp`, `mv`, `install`, `ln`, `mkdir`, `touch`, `chmod`,
@@ -161,10 +163,9 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
 - A delegated Braun:
   - **Relative paths** resolve from the session's directory: a `cd` the subagent ran in an earlier command isn't
     seen (one earlier on the same command line is).
-  - **Interrupting** Pauli's Agent call, or sending the subagent to the background, ends the delegation's run as
-    soon as the call returns: the subagent's later writes are refused.
-  - **Permissions**: the subagent runs in the foreground under the session's permission mode, like any subagent the
-    model starts.
+  - **One delegation, one run**: a Braun resumed by a message after its turn has ended has no run, so its writes
+    are refused.
+  - **Permissions**: the subagent runs under the session's permission mode, like any subagent the model starts.
 - Not yet verified live: the whole `/delegate` round trip, from the spawn to the returned report.
 - VS Code fills its commit box from `SQUASH_MSG` only while the box is empty: clear it to see a newly prepared
   message. A prepared commit you don't make stays staged, and its message stays in `.git/SQUASH_MSG`, until Braun

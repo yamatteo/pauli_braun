@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Allow, Armed, Mode, Run } from '../types'
+import type { Allow, Armed, Delegation, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
 import {
   allowedPath, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesGitDir,
@@ -93,6 +93,23 @@ async function delegatedRun($: EngineInterface, agentId: string): Promise<Run | 
   const isBraun = (await $.agent.list()).some(a => a.id === agentId && a.type === AGENT)
   if (!isBraun) return undefined
   return value !== undefined && value !== null && value.agentId === null ? value.run : null
+}
+
+/** How an agent's loop stands once it has ended. */
+const ENDED = new Set(['completed', 'failed', 'killed'])
+
+/**
+ * The open delegation, or null. One whose Braun has ended (or is gone) without the end of its turn reaching the
+ * plugin is over, and cleared here.
+ */
+async function liveDelegation($: EngineInterface): Promise<Delegation | null> {
+  const { value } = await $.state.get(DELEGATION)
+  if (value === undefined || value === null) return null
+  if (value.agentId === null) return value
+  const agent = (await $.agent.list()).find(a => a.id === value.agentId)
+  if (agent !== undefined && !ENDED.has(agent.status)) return value
+  await $.state.set(DELEGATION, null)
+  return null
 }
 
 /** The hand-off's `allow`, checked: what the brief allows Braun beyond the defaults. */
@@ -339,8 +356,8 @@ export const register: Register = (on, options) => {
       description:
         'Opens a delegation to a Braun subagent. Pauli calls it only when the user ran /delegate (the delegate ' +
         'skill), with the brief\'s allowances if any; then, in the same turn, calls the Agent tool with subagent_type ' +
-        `"${AGENT}" and the whole self-contained Brief for Braun as prompt. The Agent ` +
-        'call returns Braun\'s report; review it at once, in the same turn.',
+        `"${AGENT}" and the whole self-contained Brief for Braun as prompt. The Agent call starts Braun in the ` +
+        'background; its report arrives later as its hand-back message: review it then, not before.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -412,14 +429,14 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // What a command unlocked lasts for the turn it started; a delegation ends with its subagent's turn, and at the
-  // latest with Pauli's, which also clears one the Agent call never claimed.
+  // What a command unlocked lasts for the turn it started; a delegation ends with its subagent's turn, and one that
+  // never spawned a subagent ends with Pauli's.
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       const { value: armed } = await $.state.get(ARMED)
       if (armed?.started === true) await $.state.set(ARMED, null)
       const { value: delegation } = await $.state.get(DELEGATION)
-      if (delegation !== undefined && delegation !== null) await $.state.set(DELEGATION, null)
+      if (delegation !== undefined && delegation !== null && delegation.agentId === null) await $.state.set(DELEGATION, null)
     } else {
       const { value: delegation } = await $.state.get(DELEGATION)
       if (delegation?.agentId === e.agentId) await $.state.set(DELEGATION, null)
@@ -459,8 +476,7 @@ export const register: Register = (on, options) => {
     const { value: delegation } = await $.state.get(DELEGATION)
     if (delegation === undefined || delegation === null || !delegation.isClaimed || delegation.agentId !== null)
       return { deny: 'pauli-braun: the Braun subagent is started only by /delegate.' }
-    // Braun runs in the foreground, whatever the call asked: Pauli waits for its report in the same turn.
-    const started = await next({ ...e, background: false })
+    const started = await next(e)
     const { value: now } = await $.state.get(DELEGATION)
     if (started.agentId !== undefined && now !== undefined && now !== null && now.agentId === null)
       await $.state.set(DELEGATION, { ...now, agentId: started.agentId })
@@ -477,6 +493,8 @@ export const register: Register = (on, options) => {
     const mode = await currentMode($)
     if (mode === to) return { result: `The session is already in ${NAME[to]} mode; nothing to switch.` }
     if (to === 'braun' && (mode !== 'pauli' || !(await isArmed($, 'handoff')))) return { deny: `pauli-braun: no hand-off. ${START.handoff}` }
+    if (to === 'braun' && (await liveDelegation($)) !== null)
+      return { deny: 'pauli-braun: no hand-off: a delegated Braun is still working; wait for its report.' }
 
     let prepared = ''
     if (commit !== undefined) {
@@ -523,8 +541,7 @@ export const register: Register = (on, options) => {
     if (!(await isArmed($, 'delegate'))) return { deny: `pauli-braun: no delegation. ${START.delegate}` }
     const read = readAllow(allow)
     if ('problem' in read) return { deny: `pauli-braun: no delegation: ${read.problem}.` }
-    const { value: running } = await $.state.get(DELEGATION)
-    if (running !== undefined && running !== null) return { deny: 'pauli-braun: a delegated Braun is already working.' }
+    if ((await liveDelegation($)) !== null) return { deny: 'pauli-braun: a delegated Braun is already working.' }
     const run = await measureRun($, read).catch(err => ({ problem: String(err) }))
     if ('problem' in run) return { deny: `pauli-braun: no delegation: ${run.problem}.` }
 
@@ -533,7 +550,8 @@ export const register: Register = (on, options) => {
     return {
       result:
         `Delegation open. Now call the Agent tool with subagent_type "${AGENT}", a short ` +
-        'description, and the whole Brief for Braun as prompt. It returns Braun\'s report: review it in this same turn.' +
+        'description, and the whole Brief for Braun as prompt. It starts Braun in the background: end your turn, and ' +
+        'review Braun\'s report when it arrives as its hand-back message.' +
         allowances(run.allow, 'Allowed beyond the defaults for this delegation'),
     }
   })
@@ -555,18 +573,20 @@ export const register: Register = (on, options) => {
     if (tool.startsWith('mcp__')) return next(e)
     const input = e as unknown as Record<string, unknown>
 
-    // Pauli's one Agent call for an open delegation, whose spawn runs in the foreground; the delegation ends when the
-    // call returns.
+    // Pauli's one Agent call for an open delegation. The subagent it spawns keeps the delegation until its turn ends;
+    // a call that spawned none ends it when it returns.
     if (tool === 'Agent' && e.agentId === undefined && input.subagent_type === AGENT) {
       const once = `pauli-braun: the Braun subagent runs only once per delegation, which /delegate opens. ${START.delegate}`
       const { value: delegation, version } = await $.state.get(DELEGATION)
       if (delegation === undefined || delegation === null || delegation.isClaimed) return { deny: once }
       // Claimed only at the version read: of two calls at once, the second finds it taken.
-      if (!(await $.state.set(DELEGATION, { ...delegation, isClaimed: true }, { ifVersion: version })).isSet) return { deny: once }
+      const claimed = await $.state.set(DELEGATION, { ...delegation, isClaimed: true }, { ifVersion: version })
+      if (!claimed.isSet) return { deny: once }
       try {
         return await next(e)
       } finally {
-        await $.state.set(DELEGATION, null)
+        // A get here reads the dispatch's moment, before the spawn: unchanged since the claim, nothing was spawned.
+        await $.state.set(DELEGATION, null, { ifVersion: claimed.version })
       }
     }
 

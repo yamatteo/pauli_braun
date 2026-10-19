@@ -40,11 +40,13 @@ Then, in this same turn, make two calls:
    the repository root or absolute; commands are prefixes, matched word by word. The plugin enforces them for this
    delegation only.
 2. The `Agent` tool, with `subagent_type: "pauli-braun:braun"`, a short `description` (`Braun: <the goal>`), and the
-   whole brief as `prompt`. The plugin lets exactly this one call through, and runs it in the foreground.
+   whole brief as `prompt`. The plugin lets exactly this one call through.
 
-The Agent call returns when Braun has finished, with its report as the result. Then, in this same turn, review it
-exactly as after a hand-back: read the report, check it against the brief **and the actual changes** (`git status`,
-`git diff`, the tests), check the prepared commit if there is one (`git diff --cached --stat`, and
-`cat "$(git rev-parse --git-path SQUASH_MSG)"`), and give your verdict: accepted, needs follow-up, or blocked.
+The Agent call starts Braun in the background and returns at once, without the report. End your turn after the two
+calls, with one line saying Braun is at work, and don't review the tree before the report arrives. Braun's report
+arrives later as its hand-back message. Then review it exactly as after a hand-back: read the report, check it
+against the brief **and the actual changes** (`git status`, `git diff`, the tests), check the prepared commit if there
+is one (`git diff --cached --stat`, and `cat "$(git rev-parse --git-path SQUASH_MSG)"`), and give your verdict:
+accepted, needs follow-up, or blocked.
 
 User's notes for this delegation: $ARGUMENTS
