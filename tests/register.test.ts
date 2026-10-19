@@ -96,7 +96,7 @@ test('the run is recorded only once the session has switched to Braun', async ($
 })
 
 const DELEGATE = { tool: 'mcp__pauli-braun__delegate' } as const
-const BRAUN_CALL = { tool: 'Agent', subagent_type: AGENT, description: 'Braun: add new.txt', prompt: 'Brief for Braun: add new.txt', run_in_background: false } as const
+const BRAUN_CALL = { tool: 'Agent', subagent_type: AGENT, description: 'Braun: add new.txt', prompt: 'Brief for Braun: add new.txt' } as const
 
 test('delegating needs /delegate and Pauli mode', async ($, on) => {
   world(on)
@@ -112,7 +112,7 @@ test('delegating needs /delegate and Pauli mode', async ($, on) => {
   expect(denied(await $.tool.call({ ...DELEGATE, allow: { paths: 'x' } } as never))).toContain('no delegation')
   const opened = await delegate()
   expect(denied(opened)).toBeUndefined()
-  expect(String(opened.result)).toContain('run_in_background: false')
+  expect(String(opened.result)).toContain(`subagent_type "${AGENT}"`)
 
   // /delegate only arms from Pauli mode, and the tool only runs there.
   await command($, 'output-style', 'pauli-braun:braun')
@@ -155,7 +155,7 @@ test('a delegated Braun works under Braun\'s rules, and its report comes back to
   expect(denied(await $.tool.call(BRAUN_CALL as never))).toContain('/delegate')
 })
 
-test('the Agent call for Braun needs an open delegation, the foreground, and runs once', async ($, on) => {
+test('the Agent call for Braun needs an open delegation, and runs once', async ($, on) => {
   world(on)
   let runs = 0
   on('tool.call', async (_$, e) => (e.tool === 'Agent' && (runs += 1), { result: 'report' }))
@@ -165,14 +165,32 @@ test('the Agent call for Braun needs an open delegation, the foreground, and run
 
   await command($, 'delegate')
   await $.tool.call(DELEGATE as never)
-  const { run_in_background: _, ...inBackground } = BRAUN_CALL
-  expect(denied(await $.tool.call(inBackground as never))).toContain('run_in_background: false')
-  expect(denied(await $.tool.call({ ...BRAUN_CALL, run_in_background: true } as never))).toContain('run_in_background: false')
 
   // Two calls at once: the first claims the delegation, the second is refused.
   const [first, second] = await Promise.all([$.tool.call(BRAUN_CALL as never), $.tool.call(BRAUN_CALL as never)])
   expect([denied(first), denied(second)].filter(d => d === undefined)).toHaveLength(1)
   expect(runs).toBe(1)
+})
+
+test('a delegated Braun runs in the foreground, whatever the Agent call asks', async ($, on) => {
+  world(on)
+  const backgrounds: boolean[] = []
+  on('agent.spawn', (_$, e) => (backgrounds.push(e.background), { model: 'm', agentId: 'a1' }))
+  on('tool.call', async (_$, e) => {
+    if (e.tool !== 'Agent') return { result: 'ok' }
+    // The engine spawns the subagent as the call asked: here, in the background.
+    await $.agent.spawn({ prompt: 'go', subagentType: AGENT, background: true } as never)
+    return { result: 'report' }
+  })
+  await command($, 'output-style', 'pauli-braun:pauli')
+
+  // Without the field, and with it as a model may send it when the Agent tool doesn't define it.
+  for (const call of [BRAUN_CALL, { ...BRAUN_CALL, run_in_background: 'false' }, { ...BRAUN_CALL, run_in_background: true }]) {
+    await command($, 'delegate')
+    expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
+    expect(denied(await $.tool.call(call as never))).toBeUndefined()
+  }
+  expect(backgrounds).toEqual([false, false, false])
 })
 
 test('a delegation the Agent call never claims ends with Pauli\'s turn', async ($, on) => {

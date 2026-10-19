@@ -99,11 +99,11 @@ its untracked files at that moment, and the brief's **Allowed beyond the default
   mode change. Switching to Braun's style by hand starts no run, and every write is then refused ("start Braun
   with /handoff or /delegate").
 - Delegated, the delegate tool opens the delegation and measures its run; Pauli then makes one Agent call for the
-  Braun subagent, which must run in the foreground (`run_in_background: false`). Any other Agent call for Braun is
-  refused. The run belongs to that one subagent: the plugin applies Braun's rules to the subagent's calls, and the run
-  ends when the Agent call returns, when the subagent's turn ends, or at the latest when Pauli's turn ends (which also
-  ends a delegation the Agent call never claimed). The subagent prepares its commit through the hand-off tool, which
-  then only stages and writes the message.
+  Braun subagent, which the plugin forces into the foreground, whatever the call's `run_in_background`. Any other
+  Agent call for Braun is refused. The run belongs to that one subagent: the plugin applies Braun's rules to the
+  subagent's calls, and the run ends when the Agent call returns, when the subagent's turn ends, or at the latest
+  when Pauli's turn ends (which also ends a delegation the Agent call never claimed). The subagent prepares its
+  commit through the hand-off tool, which then only stages and writes the message.
 
 Within a run, Braun may change what can be recovered. The plugin checks each path a command writes or removes
 (file edits; redirections, `tee`, `sed -i`, `perl -i`, `cp`, `mv`, `install`, `ln`, `mkdir`, `touch`, `chmod`,

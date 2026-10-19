@@ -339,7 +339,7 @@ export const register: Register = (on, options) => {
       description:
         'Opens a delegation to a Braun subagent. Pauli calls it only when the user ran /delegate (the delegate ' +
         'skill), with the brief\'s allowances if any; then, in the same turn, calls the Agent tool with subagent_type ' +
-        `"${AGENT}", run_in_background: false, and the whole self-contained Brief for Braun as prompt. The Agent ` +
+        `"${AGENT}" and the whole self-contained Brief for Braun as prompt. The Agent ` +
         'call returns Braun\'s report; review it at once, in the same turn.',
       inputSchema: {
         type: 'object',
@@ -459,7 +459,8 @@ export const register: Register = (on, options) => {
     const { value: delegation } = await $.state.get(DELEGATION)
     if (delegation === undefined || delegation === null || !delegation.isClaimed || delegation.agentId !== null)
       return { deny: 'pauli-braun: the Braun subagent is started only by /delegate.' }
-    const started = await next(e)
+    // Braun runs in the foreground, whatever the call asked: Pauli waits for its report in the same turn.
+    const started = await next({ ...e, background: false })
     const { value: now } = await $.state.get(DELEGATION)
     if (started.agentId !== undefined && now !== undefined && now !== null && now.agentId === null)
       await $.state.set(DELEGATION, { ...now, agentId: started.agentId })
@@ -531,7 +532,7 @@ export const register: Register = (on, options) => {
     await $.state.set(DELEGATION, { run, isClaimed: false, agentId: null })
     return {
       result:
-        `Delegation open. Now call the Agent tool with subagent_type "${AGENT}", run_in_background: false, a short ` +
+        `Delegation open. Now call the Agent tool with subagent_type "${AGENT}", a short ` +
         'description, and the whole Brief for Braun as prompt. It returns Braun\'s report: review it in this same turn.' +
         allowances(run.allow, 'Allowed beyond the defaults for this delegation'),
     }
@@ -554,13 +555,12 @@ export const register: Register = (on, options) => {
     if (tool.startsWith('mcp__')) return next(e)
     const input = e as unknown as Record<string, unknown>
 
-    // Pauli's one Agent call for an open delegation, in the foreground; the delegation ends when the call returns.
+    // Pauli's one Agent call for an open delegation, whose spawn runs in the foreground; the delegation ends when the
+    // call returns.
     if (tool === 'Agent' && e.agentId === undefined && input.subagent_type === AGENT) {
       const once = `pauli-braun: the Braun subagent runs only once per delegation, which /delegate opens. ${START.delegate}`
       const { value: delegation, version } = await $.state.get(DELEGATION)
       if (delegation === undefined || delegation === null || delegation.isClaimed) return { deny: once }
-      if (input.run_in_background !== false)
-        return { deny: 'pauli-braun: a delegated Braun runs in the foreground: call Agent again with run_in_background: false.' }
       // Claimed only at the version read: of two calls at once, the second finds it taken.
       if (!(await $.state.set(DELEGATION, { ...delegation, isClaimed: true }, { ifVersion: version })).isSet) return { deny: once }
       try {

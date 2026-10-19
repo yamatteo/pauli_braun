@@ -39,8 +39,8 @@ Then, in this same turn, make two calls:
    pass the same entries as `allow: { paths: [...], commands: [...] }`: paths are globs (`*`, `**`, `?`), relative to
    the repository root or absolute; commands are prefixes, matched word by word. The plugin enforces them for this
    delegation only.
-2. The `Agent` tool, with `subagent_type: "pauli-braun:braun"`, `run_in_background: false`, a short `description`
-   (`Braun: <the goal>`), and the whole brief as `prompt`. The plugin lets exactly this one call through.
+2. The `Agent` tool, with `subagent_type: "pauli-braun:braun"`, a short `description` (`Braun: <the goal>`), and the
+   whole brief as `prompt`. The plugin lets exactly this one call through, and runs it in the foreground.
 
 The Agent call returns when Braun has finished, with its report as the result. Then, in this same turn, review it
 exactly as after a hand-back: read the report, check it against the brief **and the actual changes** (`git status`,
