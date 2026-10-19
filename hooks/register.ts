@@ -364,20 +364,19 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
-    await $.command.register({ name: 'pauli', description: 'Switch to Pauli mode: discuss, plan and review, no edits' })
-    await $.command.register({ name: 'pb-off', description: 'Leave Pauli/Braun mode (back to the default output style)' })
-    await $.command.register({
-      name: 'handoff',
-      description: 'Pauli writes the Brief for Braun and hands the session to Braun',
-      argumentHint: '[notes for the brief]',
-    })
-    await $.command.register({
-      name: 'delegate',
-      description: 'Pauli writes a detailed brief straight to a Braun subagent, waits for its report and reviews it',
-      argumentHint: '[notes for the brief]',
-    })
-    const mode = await currentMode($)
-    $.ui.status(mode === 'off' ? undefined : STATUS[mode])
+    // Each step on its own, so that one refused can't skip the rest. /handoff and /delegate are the skills' names.
+    try {
+      await $.command.register({ name: 'pauli', description: 'Switch to Pauli mode: discuss, plan and review, no edits' })
+      await $.command.register({ name: 'pb-off', description: 'Leave Pauli/Braun mode (back to the default output style)' })
+    } catch (err) {
+      $.ui.toast(`pauli-braun: registering /pauli and /pb-off failed: ${String(err)}`)
+    }
+    try {
+      const mode = await currentMode($)
+      $.ui.status(mode === 'off' ? undefined : STATUS[mode])
+    } catch (err) {
+      $.ui.toast(`pauli-braun: showing the mode on the status line failed: ${String(err)}`)
+    }
     try {
       await $.agent.register({
         name: 'braun',
@@ -428,9 +427,19 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // Typing the skills by their full names unlocks too.
+  // The skills /handoff and /delegate unlock their tools, typed by either name; the skill itself then runs.
+  on('command.run', { command: 'handoff' }, async ($, e, next) => {
+    await arm($, 'handoff')
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('command.run', { command: 'pauli-braun:handoff' }, async ($, e, next) => {
     await arm($, 'handoff')
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('command.run', { command: 'delegate' }, async ($, e, next) => {
+    await arm($, 'delegate')
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -537,24 +546,6 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'pb-off' }, async $ => {
     later($, 'leaving Pauli/Braun mode', () => switchStyle($, 'default'))
     return { text: 'Leaving Pauli/Braun mode.' }
-  })
-
-  on('command.run', { command: 'handoff' }, async ($, e) => {
-    if ((await currentMode($)) !== 'pauli') return { text: '/handoff only works from Pauli mode (/pauli).' }
-    await arm($, 'handoff')
-    later($, '/pauli-braun:handoff', async () => {
-      await $.command.run({ command: 'pauli-braun:handoff', args: e.args })
-    })
-    return { text: 'Handing off to Braun.' }
-  })
-
-  on('command.run', { command: 'delegate' }, async ($, e) => {
-    if ((await currentMode($)) !== 'pauli') return { text: '/delegate only works from Pauli mode (/pauli).' }
-    await arm($, 'delegate')
-    later($, '/pauli-braun:delegate', async () => {
-      await $.command.run({ command: 'pauli-braun:delegate', args: e.args })
-    })
-    return { text: 'Delegating to a Braun subagent.' }
   })
 
   // The guard: what each role may not do.

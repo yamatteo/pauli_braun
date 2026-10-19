@@ -6,14 +6,16 @@ const WRITE_NEW = { tool: 'Write', file_path: '/repo/new.txt', content: 'x' } as
 
 /**
  * The engine beneath the plugin: a repository at /repo with nothing untracked or ignored, slash commands that just
- * run, tool calls that succeed, and `agents` as the session's agent list. Returns what was submitted as prompts.
+ * run, tool calls that succeed, and `agents` as the session's agent list. Returns what was submitted as prompts, and
+ * the toasts shown.
  */
 function world(on: On, agents: { id: string; type: string }[] = []) {
   const prompts: string[] = []
+  const toasts: string[] = []
   const clock = mock.clock(on)
   mock.env(on, { HOME: '/home/u', TMPDIR: '/var/tmp/x' })
   on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => (toasts.push(e.text), { value: undefined }))
   on('settings.read', () => ({ value: {} }) as never)
   on('session.cwd', () => ({ value: '/repo' }))
   on('command.run', () => ({ text: 'ran' }) as never)
@@ -28,7 +30,7 @@ function world(on: On, agents: { id: string; type: string }[] = []) {
     if (args[0] === 'check-ignore') return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  return { prompts, clock }
+  return { prompts, toasts, clock }
 }
 
 /** Runs a slash command the way the user does. */
@@ -219,4 +221,39 @@ test('by default the delegated Braun inherits the session\'s model and effort', 
   await $.session.start({ cwd: '/repo' } as never)
   expect(specs[0]).toMatchObject({ model: 'inherit' })
   expect('effort' in specs[0]!).toBe(false)
+})
+
+test('typing /pauli-braun:delegate unlocks the delegation too', async ($, on) => {
+  world(on)
+  on('tool.call', () => ({ result: 'ok' }))
+  await command($, 'output-style', 'pauli-braun:pauli')
+  await command($, 'pauli-braun:delegate')
+  expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
+})
+
+test('the session starts with /pauli and /pb-off only: /handoff and /delegate are the skills', async ($, on) => {
+  world(on)
+  const commands: string[] = []
+  const agents: string[] = []
+  on('fs.read', () => ({ value: 'prompt' }) as never)
+  on('tool.register', () => ({ value: undefined }) as never)
+  on('command.register', (_$, e) => (commands.push(e.name), { value: undefined }) as never)
+  on('agent.register', (_$, e) => (agents.push(e.name), { value: { agent: AGENT } }) as never)
+  on('session.start', () => ({ cwd: '/repo' }) as never)
+  await $.session.start({ cwd: '/repo' } as never)
+  expect(commands).toEqual(['pauli', 'pb-off'])
+  expect(agents).toEqual(['braun'])
+})
+
+test('a refused command registration skips nothing else at the start of the session', async ($, on) => {
+  const { toasts } = world(on)
+  const agents: string[] = []
+  on('fs.read', () => ({ value: 'prompt' }) as never)
+  on('tool.register', () => ({ value: undefined }) as never)
+  // No command.register beneath the plugin: every command registration throws, as the engine's refusal does.
+  on('agent.register', (_$, e) => (agents.push(e.name), { value: { agent: AGENT } }) as never)
+  on('session.start', () => ({ cwd: '/repo' }) as never)
+  await $.session.start({ cwd: '/repo' } as never)
+  expect(agents).toEqual(['braun'])
+  expect(toasts.some(t => t.startsWith('pauli-braun: registering /pauli and /pb-off failed'))).toBe(true)
 })

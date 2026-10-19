@@ -165,8 +165,7 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
     soon as the call returns: the subagent's later writes are refused.
   - **Permissions**: the subagent runs in the foreground under the session's permission mode, like any subagent the
     model starts.
-- Not yet verified live: that typing `/pauli-braun:handoff` (rather than `/handoff`) unlocks the hand-off, and the
-  whole `/delegate` round trip, from the spawn to the returned report.
+- Not yet verified live: the whole `/delegate` round trip, from the spawn to the returned report.
 - VS Code fills its commit box from `SQUASH_MSG` only while the box is empty: clear it to see a newly prepared
   message. A prepared commit you don't make stays staged, and its message stays in `.git/SQUASH_MSG`, until Braun
   prepares the next one or you unstage and delete it yourself.
