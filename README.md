@@ -8,8 +8,9 @@ A Claude Code plugin for a two-role workflow inside **one session thread**:
   the commit message for you.
 
 Each role is an output style, so the active mode is visible in the status line and in the system prompt. Hooks
-guard what each role may do, and two skills carry the hand-offs. There is no plan file: the conversation is the
-record.
+guard what each role may do, and skills carry the hand-offs. There is no plan file: the conversation is the
+record. When you trust Braun with a piece of work, `/delegate` runs it in a Braun subagent instead, so its effort
+stays out of the thread.
 
 ## Install
 
@@ -26,9 +27,14 @@ Answer `y` to add the marketplace, then pick a scope (user scope makes it availa
    baseline, done-when, what Braun may do beyond its defaults, when to stop) and the session switches to Braun on
    its own. This is the only way to start Braun, and it needs a git repository: Braun's defaults are what git can
    restore.
+   Or **`/delegate [notes]`**: Pauli writes a longer, self-contained brief straight into a Braun subagent, which it
+   runs in the foreground and waits for (in the thread there is one line, `Delegating: <goal>`).
 3. **Braun builds**, checks the done-when, writes a *report* and hands back to Pauli automatically, whether the work
-   is done or blocked on something unexpected.
+   is done or blocked on something unexpected. A delegated Braun's report is what Pauli's Agent call returns.
 4. **Pauli reviews** the report against the brief and the actual diff, and gives a verdict. Back to 1.
+
+`/handoff` and `/delegate` are the only ways to start Braun: the plugin refuses a hand-off or a delegation the
+user's command didn't start, so Pauli never starts Braun on its own.
 
 Committing is left to you, but prepared. When Braun hands back done work, it names the files it changed and writes
 a [Conventional Commits](https://www.conventionalcommits.org) message; the plugin stages those files and writes the
@@ -45,11 +51,31 @@ the message isn't a Conventional Commits one. Files that were already dirty befo
 | `/pauli` | Switch to Pauli mode |
 | `/pb-off` | Leave Pauli/Braun mode (back to the default output style) |
 | `/handoff [notes]` | From Pauli mode: write the brief and hand off to Braun |
+| `/delegate [notes]` | From Pauli mode: write a self-contained brief for a Braun subagent, wait for its report, review it |
+
+## Settings
+
+The delegated Braun's model and effort, by default the session's:
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `braunModel` | `inherit`, `haiku`, `sonnet`, `opus` | `inherit` (the session's model) |
+| `braunEffort` | `inherit`, `low`, `medium`, `high`, `xhigh`, `max` | `inherit` (the session's effort) |
+
+Set them in `/config` in a terminal session (a change reloads the plugin, and the next `/delegate` uses it), on the
+install screen, or in a settings file:
+
+```json
+{ "pluginConfigs": { "pauli-braun": { "options": { "braunModel": "sonnet", "braunEffort": "high" } } } }
+```
+
+They don't touch `/handoff`: in-thread Braun runs on whatever the session runs on.
 
 ## Guards
 
 In either mode, subagents and worktrees are refused (`Agent`, `Workflow`, `EnterWorktree`): everything stays in
-the one thread.
+the one thread, except the plugin's own Braun subagent, which the model is offered only within a delegation that
+`/delegate` opened.
 
 **Pauli** may read, search, run tests and run read-only git (`status`, `log`, `diff`, `show`, `blame`, `fetch`,
 listing branches/tags/stashes, `config --get`…). Refused:
@@ -62,10 +88,22 @@ listing branches/tags/stashes, `config --get`…). Refused:
   `perl -i`;
 - package installs and removals (`npm install`, `uv add`, `pip install`, `cargo add`, `apt`…).
 
-**Braun** works within a *run*, which `/handoff` starts: the plugin notes the repository's root and its untracked
-files at that moment, and the brief's **Allowed beyond the defaults** (passed to the hand-off as `allow`). The run
-ends when the session leaves Braun mode. Switching to Braun's style by hand starts no run, and every write is then
-refused ("start Braun with /handoff").
+**Starting Braun.** `/handoff` and `/delegate` (or their skills typed by full name, `/pauli-braun:handoff`,
+`/pauli-braun:delegate`) unlock the matching tool for the turn they start, from Pauli mode only; the tool refuses
+otherwise.
+
+**Braun** works within a *run*, which `/handoff` or `/delegate` starts: the plugin notes the repository's root and
+its untracked files at that moment, and the brief's **Allowed beyond the defaults** (passed as `allow`).
+
+- In the thread, the run is recorded once the session has actually switched to Braun, and it ends at the next
+  mode change. Switching to Braun's style by hand starts no run, and every write is then refused ("start Braun
+  with /handoff or /delegate").
+- Delegated, the delegate tool opens the delegation and measures its run; Pauli then makes one Agent call for the
+  Braun subagent, which must run in the foreground (`run_in_background: false`). Any other Agent call for Braun is
+  refused. The run belongs to that one subagent: the plugin applies Braun's rules to the subagent's calls, and the run
+  ends when the Agent call returns, when the subagent's turn ends, or at the latest when Pauli's turn ends (which also
+  ends a delegation the Agent call never claimed). The subagent prepares its commit through the hand-off tool, which
+  then only stages and writes the message.
 
 Within a run, Braun may change what can be recovered. The plugin checks each path a command writes or removes
 (file edits; redirections, `tee`, `sed -i`, `perl -i`, `cp`, `mv`, `install`, `ln`, `mkdir`, `touch`, `chmod`,
@@ -120,6 +158,15 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
     name, but the contents of a tree (`cp -r`, `rsync dir/`) aren't checked file by file.
 - Every Braun turn ends with a report and a hand-back to Pauli: a turn that ends without one is sent back once to
   write it.
+- A delegated Braun:
+  - **Relative paths** resolve from the session's directory: a `cd` the subagent ran in an earlier command isn't
+    seen (one earlier on the same command line is).
+  - **Interrupting** Pauli's Agent call, or sending the subagent to the background, ends the delegation's run as
+    soon as the call returns: the subagent's later writes are refused.
+  - **Permissions**: the subagent runs in the foreground under the session's permission mode, like any subagent the
+    model starts.
+- Not yet verified live: that typing `/pauli-braun:handoff` (rather than `/handoff`) unlocks the hand-off, and the
+  whole `/delegate` round trip, from the spawn to the returned report.
 - VS Code fills its commit box from `SQUASH_MSG` only while the box is empty: clear it to see a newly prepared
   message. A prepared commit you don't make stays staged, and its message stays in `.git/SQUASH_MSG`, until Braun
   prepares the next one or you unstage and delete it yourself.

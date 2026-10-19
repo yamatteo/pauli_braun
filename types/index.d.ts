@@ -8,13 +8,29 @@ export type Allow = {
   commands: string[]
 }
 
-/** A Braun run, from the hand-off to Braun until the mode stops being Braun. */
+/** A Braun run: in the thread, from the switch to Braun until the mode changes; delegated, for one subagent. */
 export type Run = {
   /** The repository's top level, absolute. */
   root: string
   allow: Allow
   /** The untracked, not ignored, files when the run started, relative to `root`. */
   untrackedAtStart: string[]
+}
+
+/**
+ * A delegated Braun: its run, whether Pauli's one Agent call for it has gone through, and the subagent's id once its
+ * spawn has answered.
+ */
+export type Delegation = {
+  run: Run
+  isClaimed: boolean
+  agentId: string | null
+}
+
+/** Which command the user ran to start Braun, and whether its turn has started. */
+export type Armed = {
+  kind: 'handoff' | 'delegate'
+  started: boolean
 }
 
 declare module 'claude-code' {
@@ -24,8 +40,12 @@ declare module 'claude-code' {
       mode: Mode
       /** Whether the current turn has already called the handoff tool. */
       handedOff: boolean
-      /** The current Braun run; null when none. */
+      /** The current in-thread Braun run; null when none. */
       run: Run | null
+      /** The current delegated Braun; null when none. */
+      delegation: Delegation | null
+      /** What /handoff or /delegate unlocked; null when nothing. */
+      armed: Armed | null
     }
   }
 }

@@ -5,5 +5,21 @@
   "author": { "name": "yamatteo" },
   "repository": "https://github.com/yamatteo/pauli_braun",
   "license": "MIT",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "braunModel": {
+      "type": "string",
+      "title": "Delegated Braun's model",
+      "description": "The model of the Braun subagent /delegate starts; inherit uses the session's.",
+      "options": ["inherit", "haiku", "sonnet", "opus"],
+      "default": "inherit"
+    },
+    "braunEffort": {
+      "type": "string",
+      "title": "Delegated Braun's effort",
+      "description": "The effort of the Braun subagent /delegate starts; inherit uses the session's.",
+      "options": ["inherit", "low", "medium", "high", "xhigh", "max"],
+      "default": "inherit"
+    }
+  }
 }

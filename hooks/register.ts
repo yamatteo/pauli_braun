@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Allow, Mode, Run } from '../types'
+import type { Allow, Armed, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
 import {
   allowedPath, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesGitDir,
@@ -10,8 +10,16 @@ import {
 const MODE = { plugin: 'pauli-braun', key: 'mode' } as const
 const HANDED_OFF = { plugin: 'pauli-braun', key: 'handedOff' } as const
 const RUN = { plugin: 'pauli-braun', key: 'run' } as const
+const DELEGATION = { plugin: 'pauli-braun', key: 'delegation' } as const
+const ARMED = { plugin: 'pauli-braun', key: 'armed' } as const
 
 const HANDOFF_TOOL = 'mcp__pauli-braun__handoff'
+const DELEGATE_TOOL = 'mcp__pauli-braun__delegate'
+/** The Braun subagent /delegate starts. */
+const AGENT = 'pauli-braun:braun'
+
+const MODELS = ['inherit', 'haiku', 'sonnet', 'opus']
+const EFFORTS = ['inherit', 'low', 'medium', 'high', 'xhigh', 'max']
 
 const STYLE: Record<Role, string> = { pauli: 'pauli-braun:pauli', braun: 'pauli-braun:braun' }
 const NAME: Record<Role, string> = { pauli: 'Pauli', braun: 'Braun' }
@@ -26,6 +34,12 @@ const ADVICE: Record<Role, string> = {
     'you would have done in your report. To stage finished work and prepare its commit message, pass "commit" to the ' +
     'hand-off (pauli-braun:report).',
 }
+const START: Record<Armed['kind'], string> = {
+  handoff: 'Only the user starts Braun: ask them to run /handoff.',
+  delegate: 'Only the user starts Braun: ask them to run /delegate.',
+}
+const NO_RUN = 'there is no Braun run. Start Braun with /handoff or /delegate.'
+const DELEGATED_END = 'Now end with your report as your final message: Pauli reviews it.'
 const KICKOFF: Record<Role, string> = {
   braun: 'Braun, Pauli has handed off to you: carry out the latest "Brief for Braun" above.',
   pauli: 'Pauli, Braun has handed back to you: review Braun\'s report above against the brief and the actual changes, and give your verdict.',
@@ -45,14 +59,40 @@ async function currentMode($: EngineInterface): Promise<Mode> {
   return modeOf(typeof outputStyle === 'string' ? outputStyle : undefined)
 }
 
-/** Records the mode and shows it on the status line, when it changed; leaving Braun mode ends the Braun run. */
+/**
+ * Records the mode and shows it on the status line, when it changed. Any change ends the in-thread Braun run: the
+ * hand-off records a new one only after its own switch to Braun.
+ */
 async function applyMode($: EngineInterface, mode: Mode): Promise<void> {
   const { value } = await $.state.get(MODE)
   if (value !== mode) {
     await $.state.set(MODE, mode)
     $.ui.status(mode === 'off' ? undefined : STATUS[mode])
-    if (value === 'braun') await $.state.set(RUN, null)
+    await $.state.set(RUN, null)
   }
+}
+
+/** Unlocks the tool that starts Braun, for the turn the user's command starts; only from Pauli mode. */
+async function arm($: EngineInterface, kind: Armed['kind']): Promise<void> {
+  if ((await currentMode($)) === 'pauli') await $.state.set(ARMED, { kind, started: false })
+}
+
+async function isArmed($: EngineInterface, kind: Armed['kind']): Promise<boolean> {
+  const { value } = await $.state.get(ARMED)
+  return value?.kind === kind
+}
+
+/**
+ * The run of a subagent's tool call: the delegated run when the subagent is the delegated Braun, null for a Braun
+ * subagent with no delegation, undefined for any other agent. Before the spawn has answered with the id, the agent
+ * list tells which agent is a Braun.
+ */
+async function delegatedRun($: EngineInterface, agentId: string): Promise<Run | null | undefined> {
+  const { value } = await $.state.get(DELEGATION)
+  if (value !== undefined && value !== null && value.agentId === agentId) return value.run
+  const isBraun = (await $.agent.list()).some(a => a.id === agentId && a.type === AGENT)
+  if (!isBraun) return undefined
+  return value !== undefined && value !== null && value.agentId === null ? value.run : null
 }
 
 /** The hand-off's `allow`, checked: what the brief allows Braun beyond the defaults. */
@@ -67,15 +107,20 @@ function readAllow(allow: unknown): Allow | { problem: string } {
   return { paths: p, commands: c }
 }
 
-/** Starts a Braun run: the repository's root and its untracked files now, and what the brief allows. */
-async function startRun($: EngineInterface, allow: Allow): Promise<{ problem: string } | undefined> {
+/** Measures a Braun run: the repository's root and its untracked files now, and what the brief allows. */
+async function measureRun($: EngineInterface, allow: Allow): Promise<Run | { problem: string }> {
   const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
   if (top.exitCode !== 0) return { problem: 'this folder is not in a git repository, so nothing Braun changes could be restored' }
   const root = top.stdout.trim()
   const untracked = await $.process.run(['git', 'ls-files', '-z', '--others', '--exclude-standard'], { cwd: root })
   if (untracked.exitCode !== 0) return { problem: `git ls-files failed: ${untracked.stderr.trim()}` }
-  await $.state.set(RUN, { root, allow, untrackedAtStart: untracked.stdout.split('\0').filter(Boolean) })
-  return undefined
+  return { root, allow, untrackedAtStart: untracked.stdout.split('\0').filter(Boolean) }
+}
+
+/** The allowances of a run, as a sentence for a tool's result; empty when there are none. */
+function allowances(allow: Allow, lead: string): string {
+  return allow.paths.length + allow.commands.length === 0 ? ''
+    : ` ${lead}: ${[...allow.paths, ...allow.commands.map(c => `\`${c}\``)].join(', ')}.`
 }
 
 const NOTHING_KNOWN: PathFacts = {
@@ -198,6 +243,22 @@ async function prepareCommit($: EngineInterface, commit: unknown): Promise<{ don
   }
 }
 
+/** The handoff tool called from a subagent: only the delegated Braun, handing back, and only to prepare its commit. */
+async function delegatedHandBack($: EngineInterface, agentId: string, to: Role, commit: unknown) {
+  const run = await delegatedRun($, agentId)
+  if (run === undefined || run === null)
+    return { deny: 'pauli-braun: from a subagent, only the Braun that /delegate started calls the hand-off.' }
+  if (to !== 'pauli') return { deny: 'pauli-braun: a delegated Braun hands back to Pauli only.' }
+  if (commit === undefined) return { result: `No commit prepared. ${DELEGATED_END}` }
+  const outcome = await prepareCommit($, commit).catch(err => ({ problem: String(err) }))
+  if ('problem' in outcome)
+    return {
+      deny: `pauli-braun: no commit prepared: ${outcome.problem}. Correct it and call again, or end without "commit" ` +
+        'and say in your report why no commit was prepared.',
+    }
+  return { result: `${outcome.done} ${DELEGATED_END}` }
+}
+
 /** Switches the output style, then records the mode itself: the plugin's own /output-style hook doesn't see this run. */
 async function switchStyle($: EngineInterface, style: string): Promise<void> {
   await $.command.run({ command: 'output-style', args: style })
@@ -216,7 +277,11 @@ function later($: EngineInterface, label: string, work: () => Promise<void>): vo
   })
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const pick = (value: unknown, allowed: string[]) => (typeof value === 'string' && allowed.includes(value) ? value : 'inherit')
+  const model = pick(options.braunModel, MODELS)
+  const effort = pick(options.braunEffort, EFFORTS)
+
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'handoff',
@@ -269,6 +334,36 @@ export const register: Register = on => {
       },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'delegate',
+      description:
+        'Opens a delegation to a Braun subagent. Pauli calls it only when the user ran /delegate (the delegate ' +
+        'skill), with the brief\'s allowances if any; then, in the same turn, calls the Agent tool with subagent_type ' +
+        `"${AGENT}", run_in_background: false, and the whole self-contained Brief for Braun as prompt. The Agent ` +
+        'call returns Braun\'s report; review it at once, in the same turn.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          allow: {
+            type: 'object',
+            description: 'The brief\'s "Allowed beyond the defaults", enforced for this delegation only.',
+            properties: {
+              paths: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Globs (`*`, `**`, `?`), relative to the repository root or absolute, Braun may write and remove.',
+              },
+              commands: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Command prefixes, matched word by word, Braun may run although they install globally or use sudo.',
+              },
+            },
+          },
+        },
+      },
+      isDeferred: false,
+    })
     await $.command.register({ name: 'pauli', description: 'Switch to Pauli mode: discuss, plan and review, no edits' })
     await $.command.register({ name: 'pb-off', description: 'Leave Pauli/Braun mode (back to the default output style)' })
     await $.command.register({
@@ -276,8 +371,24 @@ export const register: Register = on => {
       description: 'Pauli writes the Brief for Braun and hands the session to Braun',
       argumentHint: '[notes for the brief]',
     })
+    await $.command.register({
+      name: 'delegate',
+      description: 'Pauli writes a detailed brief straight to a Braun subagent, waits for its report and reviews it',
+      argumentHint: '[notes for the brief]',
+    })
     const mode = await currentMode($)
     $.ui.status(mode === 'off' ? undefined : STATUS[mode])
+    try {
+      await $.agent.register({
+        name: 'braun',
+        description: 'Braun, started only by the pauli-braun plugin for /delegate.',
+        prompt: await $.fs.read(`${$.plugin.root}/prompts/braun.md`),
+        model,
+        ...(effort === 'inherit' ? {} : { effort }),
+      })
+    } catch (err) {
+      $.ui.toast(`pauli-braun: registering the Braun subagent failed, so /delegate won't work: ${String(err)}`)
+    }
     return next(e)
   })
 
@@ -297,15 +408,65 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     await $.state.set(HANDED_OFF, false)
+    const { value: armed } = await $.state.get(ARMED)
+    if (armed !== undefined && armed !== null && !armed.started) await $.state.set(ARMED, { ...armed, started: true })
     return next(e)
   })
+
+  // What a command unlocked lasts for the turn it started; a delegation ends with its subagent's turn, and at the
+  // latest with Pauli's, which also clears one the Agent call never claimed.
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      const { value: armed } = await $.state.get(ARMED)
+      if (armed?.started === true) await $.state.set(ARMED, null)
+      const { value: delegation } = await $.state.get(DELEGATION)
+      if (delegation !== undefined && delegation !== null) await $.state.set(DELEGATION, null)
+    } else {
+      const { value: delegation } = await $.state.get(DELEGATION)
+      if (delegation?.agentId === e.agentId) await $.state.set(DELEGATION, null)
+    }
+    return next(e)
+  })
+
+  // Typing the skills by their full names unlocks too.
+  on('command.run', { command: 'pauli-braun:handoff' }, async ($, e, next) => {
+    await arm($, 'handoff')
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('command.run', { command: 'pauli-braun:delegate' }, async ($, e, next) => {
+    await arm($, 'delegate')
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // The Braun subagent is hidden from the model, and only Pauli's one Agent call for a delegation spawns it.
+  on('agent.offer', { agent: AGENT }, async $ => {
+    const { value: delegation } = await $.state.get(DELEGATION)
+    return { isOffered: delegation !== undefined && delegation !== null && delegation.agentId === null }
+  }).catch(() => ({ isOffered: false }))
+
+  on('agent.spawn', async ($, e, next) => {
+    if (e.subagentType !== AGENT) return next(e)
+    const { value: delegation } = await $.state.get(DELEGATION)
+    if (delegation === undefined || delegation === null || !delegation.isClaimed || delegation.agentId !== null)
+      return { deny: 'pauli-braun: the Braun subagent is started only by /delegate.' }
+    const started = await next(e)
+    const { value: now } = await $.state.get(DELEGATION)
+    if (started.agentId !== undefined && now !== undefined && now !== null && now.agentId === null)
+      await $.state.set(DELEGATION, { ...now, agentId: started.agentId })
+    return started
+  }).catch(($, e, next) =>
+    next.called || e.subagentType !== AGENT ? next(e) : { deny: 'pauli-braun: its guard failed, so the Braun subagent was not started.' },
+  )
 
   on('tool.call', { tool: HANDOFF_TOOL }, async ($, e) => {
     const { to, commit, allow } = e as unknown as { to?: unknown; commit?: unknown; allow?: unknown }
     if (to !== 'pauli' && to !== 'braun') return { deny: 'pauli-braun: "to" must be "pauli" or "braun".' }
     if (allow !== undefined && to !== 'braun') return { deny: 'pauli-braun: only a hand-off to Braun takes "allow".' }
+    if (e.agentId !== undefined) return delegatedHandBack($, e.agentId, to, commit)
     const mode = await currentMode($)
     if (mode === to) return { result: `The session is already in ${NAME[to]} mode; nothing to switch.` }
+    if (to === 'braun' && (mode !== 'pauli' || !(await isArmed($, 'handoff')))) return { deny: `pauli-braun: no hand-off. ${START.handoff}` }
 
     let prepared = ''
     if (commit !== undefined) {
@@ -319,25 +480,51 @@ export const register: Register = on => {
       prepared = ` ${outcome.done}`
     }
 
-    // A hand-off to Braun starts a run: what git can restore is measured now, and the brief's allowances recorded.
-    let allowed = ''
+    // A hand-off to Braun measures its run now (what git can restore, the brief's allowances), but records it only
+    // once the session has switched to Braun: a switch that never happens leaves no run behind.
+    let run: Run | undefined
     if (to === 'braun') {
       const read = readAllow(allow)
       if ('problem' in read) return { deny: `pauli-braun: no hand-off: ${read.problem}.` }
-      const problem = await startRun($, read).catch(err => ({ problem: String(err) }))
-      if (problem !== undefined) return { deny: `pauli-braun: no hand-off: ${problem.problem}.` }
-      if (read.paths.length + read.commands.length > 0)
-        allowed = ` Allowed beyond the defaults for this run: ${[...read.paths, ...read.commands.map(c => `\`${c}\``)].join(', ')}.`
+      const measured = await measureRun($, read).catch(err => ({ problem: String(err) }))
+      if ('problem' in measured) return { deny: `pauli-braun: no hand-off: ${measured.problem}.` }
+      run = measured
+      await $.state.set(ARMED, null)
     }
+    const allowed = run === undefined ? '' : allowances(run.allow, 'Allowed beyond the defaults for this run')
 
     await $.state.set(HANDED_OFF, true)
     later($, `the hand-off to ${NAME[to]}`, async () => {
       await switchStyle($, STYLE[to])
+      if (run !== undefined) await $.state.set(RUN, run)
       await $.prompt.submit({ text: KICKOFF[to] })
     })
     return {
       result: `Hand-off to ${NAME[to]} scheduled: the output style switches to ${STYLE[to]} when this turn ends, ` +
         `and ${NAME[to]} starts on its own.${prepared}${allowed} End your turn now, with no further tool calls.`,
+    }
+  })
+
+  // /delegate opens a delegation, under a run of its own; Pauli's next call, the Agent tool, runs the subagent.
+  on('tool.call', { tool: DELEGATE_TOOL }, async ($, e) => {
+    const { allow } = e as unknown as { allow?: unknown }
+    if (e.agentId !== undefined || (await currentMode($)) !== 'pauli')
+      return { deny: 'pauli-braun: only Pauli, in the main thread, delegates.' }
+    if (!(await isArmed($, 'delegate'))) return { deny: `pauli-braun: no delegation. ${START.delegate}` }
+    const read = readAllow(allow)
+    if ('problem' in read) return { deny: `pauli-braun: no delegation: ${read.problem}.` }
+    const { value: running } = await $.state.get(DELEGATION)
+    if (running !== undefined && running !== null) return { deny: 'pauli-braun: a delegated Braun is already working.' }
+    const run = await measureRun($, read).catch(err => ({ problem: String(err) }))
+    if ('problem' in run) return { deny: `pauli-braun: no delegation: ${run.problem}.` }
+
+    await $.state.set(ARMED, null)
+    await $.state.set(DELEGATION, { run, isClaimed: false, agentId: null })
+    return {
+      result:
+        `Delegation open. Now call the Agent tool with subagent_type "${AGENT}", run_in_background: false, a short ` +
+        'description, and the whole Brief for Braun as prompt. It returns Braun\'s report: review it in this same turn.' +
+        allowances(run.allow, 'Allowed beyond the defaults for this delegation'),
     }
   })
 
@@ -354,23 +541,52 @@ export const register: Register = on => {
 
   on('command.run', { command: 'handoff' }, async ($, e) => {
     if ((await currentMode($)) !== 'pauli') return { text: '/handoff only works from Pauli mode (/pauli).' }
+    await arm($, 'handoff')
     later($, '/pauli-braun:handoff', async () => {
       await $.command.run({ command: 'pauli-braun:handoff', args: e.args })
     })
     return { text: 'Handing off to Braun.' }
   })
 
+  on('command.run', { command: 'delegate' }, async ($, e) => {
+    if ((await currentMode($)) !== 'pauli') return { text: '/delegate only works from Pauli mode (/pauli).' }
+    await arm($, 'delegate')
+    later($, '/pauli-braun:delegate', async () => {
+      await $.command.run({ command: 'pauli-braun:delegate', args: e.args })
+    })
+    return { text: 'Delegating to a Braun subagent.' }
+  })
+
   // The guard: what each role may not do.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
     if (tool.startsWith('mcp__')) return next(e)
-    const mode = await currentMode($)
+    const input = e as unknown as Record<string, unknown>
+
+    // Pauli's one Agent call for an open delegation, in the foreground; the delegation ends when the call returns.
+    if (tool === 'Agent' && e.agentId === undefined && input.subagent_type === AGENT) {
+      const once = `pauli-braun: the Braun subagent runs only once per delegation, which /delegate opens. ${START.delegate}`
+      const { value: delegation, version } = await $.state.get(DELEGATION)
+      if (delegation === undefined || delegation === null || delegation.isClaimed) return { deny: once }
+      if (input.run_in_background !== false)
+        return { deny: 'pauli-braun: a delegated Braun runs in the foreground: call Agent again with run_in_background: false.' }
+      // Claimed only at the version read: of two calls at once, the second finds it taken.
+      if (!(await $.state.set(DELEGATION, { ...delegation, isClaimed: true }, { ifVersion: version })).isSet) return { deny: once }
+      try {
+        return await next(e)
+      } finally {
+        await $.state.set(DELEGATION, null)
+      }
+    }
+
+    // A subagent's call is Braun's when the subagent is a Braun; any other follows the session's mode.
+    const delegated = e.agentId === undefined ? undefined : await delegatedRun($, e.agentId)
+    const mode = delegated === undefined ? await currentMode($) : 'braun'
     if (mode === 'off') return next(e)
 
     const refuse = (why: string) => ({
       deny: `pauli-braun (${NAME[mode]} mode): ${why} is blocked. ${ADVICE[mode]}`,
     })
-    const input = e as unknown as Record<string, unknown>
 
     if (THREAD_TOOLS.has(tool)) return refuse(`${tool} (everything stays in this one thread)`)
     const path = String(input.file_path ?? input.notebook_path ?? '')
@@ -387,13 +603,11 @@ export const register: Register = on => {
       return next(e)
     }
 
-    // Braun works only within a run, which /handoff starts; without one, only what Pauli may do.
-    const { value: run } = await $.state.get(RUN)
+    // Braun works only within a run, which /handoff or /delegate starts; without one, only what Pauli may do.
+    const run = delegated === undefined ? (await $.state.get(RUN)).value : delegated
     if (run === undefined || run === null) {
       const why = EDIT_TOOLS.has(tool) ? tool : tool === 'Bash' ? checkBash(command, 'pauli').deny : undefined
-      return why === undefined
-        ? next(e)
-        : { deny: `pauli-braun (Braun mode): ${why} is blocked: there is no Braun run. Start Braun with /handoff.` }
+      return why === undefined ? next(e) : { deny: `pauli-braun (Braun mode): ${why} is blocked: ${NO_RUN}` }
     }
     const ctx = { cwd: await $.session.cwd(), home: await $.env.get('HOME'), tmpdir: await $.env.get('TMPDIR'), allowCommands: run.allow.commands }
     let targets: Target[] = []
