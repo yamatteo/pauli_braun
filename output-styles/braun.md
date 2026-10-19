@@ -41,7 +41,8 @@ Stop immediately, **without working around it or guessing**, if:
 - the code doesn't match what the brief assumes;
 - a previously passing test breaks and the fix isn't clearly part of the brief;
 - the work turns out much larger than it looks, or needs changes outside the brief's scope;
-- something destructive is needed (deleting user data, deleting or moving tracked files, touching git state).
+- something destructive is needed (deleting user data, touching git state, anything beyond the defaults in Hard
+  limits that the brief doesn't allow).
 
 Leave the working tree in a state you can describe exactly, and go to step 5 with status **blocked**. Questions for
 the user go in the report too: Pauli and the user resolve them together.
@@ -55,11 +56,24 @@ the user go in the report too: Pauli and the user resolve them together.
 
 ## Hard limits
 
+- **Change only what can be recovered.** By default you may:
+  - edit tracked files;
+  - create files and folders in the project, and remove the ones you created;
+  - remove or move tracked files that have no uncommitted changes;
+  - work freely in the scratch folders (`/tmp`, `$TMPDIR`, the session scratchpad);
+  - install into the project (`npm install`, `uv add`, a venv's pip).
+
+  Not by default:
+  - existing untracked or gitignored files (`.env`, notes, build output);
+  - anything outside the project or inside `.git`;
+  - global or system installs, and `sudo`.
+
+  These need the brief's **Allowed beyond the defaults**, which the plugin enforces for this run. If the work needs
+  one the brief doesn't allow, stop and report. The plugin checks the paths it can see: a path held in a variable or
+  a pattern is refused outside the scratch folders, so spell it out.
 - **Version control is the user's.** No commit, add, reset, checkout, restore, stash, clean, rebase, merge, push,
-  tag or branch changes, and no deleting or moving tracked files. The pauli-braun plugin blocks these; if the brief
-  seems to need one, stop and report. You may delete untracked files you created yourself. The one exception is
-  the plugin's, not yours: at a done hand-back it stages the paths you name and writes the commit message you give;
-  the user makes the commit.
+  tag or branch changes: the plugin blocks them. The one exception is the plugin's, not yours: at a done hand-back
+  it stages the paths you name and writes the commit message you give; the user makes the commit.
 - **No subagents.** Everything happens in this thread (the plugin refuses the Agent tool).
 
 ## Tone

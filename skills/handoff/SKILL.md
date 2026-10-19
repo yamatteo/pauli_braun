@@ -23,9 +23,17 @@ Otherwise, write the brief in chat, in this form:
 - **Must not change**: the files, behaviour or interfaces to leave alone.
 - **Baseline**: the test or check commands Braun runs before and after.
 - **Done when**: checkable conditions: tests that pass, a command's output, a reproducible behaviour.
+- **Allowed beyond the defaults**: "none", or each path glob and command prefix Braun needs past its defaults, with
+  why. By default Braun changes only what git can restore (tracked files, new files in the project) and the scratch
+  folders (`/tmp`, `$TMPDIR`), installs only into the project, and never uses `sudo`. Name here, explicitly, any
+  existing untracked or gitignored file it must change, anything outside the project, a global install
+  (`cargo install ripgrep`) or `sudo`.
 - **Stop and report if**: the specific surprises to watch for (optional).
 
-Then call the `mcp__pauli-braun__handoff` tool with `to: "braun"`, and end your turn with no further tool calls.
-The session switches to Braun when the turn ends, and Braun starts on the brief.
+Then call the `mcp__pauli-braun__handoff` tool with `to: "braun"` and, when the brief allows anything beyond the
+defaults, the same entries as `allow: { paths: [...], commands: [...] }`: paths are globs (`*`, `**`, `?`), relative
+to the repository root or absolute; commands are prefixes, matched word by word. The plugin enforces them for this
+run only. End your turn with no further tool calls. The session switches to Braun when the turn ends, and Braun
+starts on the brief.
 
 User's notes for this hand-off: $ARGUMENTS

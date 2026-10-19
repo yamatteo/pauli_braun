@@ -9,8 +9,23 @@ export type Role = 'pauli' | 'braun'
 /** One simple command: its words (quotes removed) and where it redirects output. */
 export type SimpleCommand = { words: string[]; redirects: string[] }
 
-/** What a role's Bash check found: a refusal, and paths whose tracked status must be checked. */
-export type BashVerdict = { deny?: string; mustBeUntracked: string[] }
+/** What a command does to a path: writes (creates, changes) or removes it. */
+export type Operation = 'write' | 'remove'
+
+/**
+ * A path a Braun command writes or removes, absolute. `sources` are what a cp, mv, ln, install or rsync puts at
+ * `path`: when `path` turns out to be a directory, the files that land in it are `path/<basename of each source>`.
+ */
+export type Target = { path: string; op: Operation; sources?: string[] }
+
+/** What a role's Bash check found: a refusal, and the paths Braun's command writes or removes. */
+export type BashVerdict = { deny?: string; targets: Target[] }
+
+/**
+ * Where Braun's paths are resolved: the directory relative paths start from, the values `~`, `$HOME` and `$TMPDIR`
+ * expand to, and the command prefixes the brief allows beyond the defaults.
+ */
+export type PathContext = { cwd: string; home?: string; tmpdir?: string; allowCommands?: readonly string[] }
 
 /** Tools no mode may use: everything stays in this one thread. */
 export const THREAD_TOOLS = new Set(['Agent', 'Workflow', 'EnterWorktree'])
@@ -118,7 +133,9 @@ export function parse(source: string): SimpleCommand[] {
       endWord()
       while (src[i + 1] === '<') i++
       target = 'skip'
-    } else if (c === '\n' || c === ';' || c === '|' || c === '&' || c === '(' || c === ')' || c === '{' || c === '}') {
+    } else if (c === '\n' || c === ';' || c === '|' || c === '&' || c === '(' || c === ')' ||
+      // Braces group commands only as words of their own: `${HOME}` and `xargs -I{}` keep theirs.
+      (c === '{' || c === '}') && !hasWord && /^$|[\s;|&()<>]/.test(src[i + 1] ?? '')) {
       endCommand()
     } else {
       word += c
@@ -135,14 +152,19 @@ export function parse(source: string): SimpleCommand[] {
 
 const WRAPPERS = new Set(['sudo', 'doas', 'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'env', 'timeout', 'watch'])
 
-/** The program and its arguments, past env assignments and wrappers such as `sudo` or `xargs`. */
-function unwrap(words: string[]): { argv: string[]; viaXargs: boolean } {
+/**
+ * The program and its arguments, past env assignments and wrappers such as `sudo` or `xargs`; `privileged` names the
+ * `sudo` or `doas` met on the way.
+ */
+function unwrap(words: string[]): { argv: string[]; viaXargs: boolean; privileged?: string } {
   let rest = words
   let viaXargs = false
+  let privileged: string | undefined
   for (;;) {
     while (rest.length > 0 && /^[A-Za-z_]\w*=/.test(rest[0]!)) rest = rest.slice(1)
     const head = basename(rest[0] ?? '')
     if (WRAPPERS.has(head)) {
+      if (head === 'sudo' || head === 'doas') privileged ??= head
       rest = rest.slice(1)
       while (rest.length > 0 && rest[0]!.startsWith('-')) rest = rest.slice(1)
       if (head === 'timeout' && rest.length > 0) rest = rest.slice(1)
@@ -153,7 +175,7 @@ function unwrap(words: string[]): { argv: string[]; viaXargs: boolean } {
         const flag = rest[0]!
         rest = rest.slice(/^-[IdEnLPs]$|^--(?:replace|delimiter|max-args|max-procs)$/.test(flag) ? 2 : 1)
       }
-    } else return { argv: rest, viaXargs }
+    } else return { argv: rest, viaXargs, privileged }
   }
 }
 
@@ -168,7 +190,7 @@ function positionals(args: string[]): string[] {
   return [...before.filter(a => !a.startsWith('-')), ...after]
 }
 
-function touchesGitDir(path: string): boolean {
+export function touchesGitDir(path: string): boolean {
   return /(^|\/)\.git(\/|$)/.test(path)
 }
 
@@ -275,20 +297,316 @@ function pauliChange(argv: string[], redirects: string[]): string | undefined {
   return undefined
 }
 
-function analyse(command: string, role: Role, verdict: BashVerdict, depth: number): void {
+// --- Braun: paths -------------------------------------------------------
+
+/** An absolute path with `.`, `..` and repeated slashes resolved. */
+export function normalize(path: string): string {
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part)
+  }
+  return `/${parts.join('/')}`
+}
+
+/** `path` taken from `base` when relative, normalized. */
+export function resolvePath(base: string, path: string): string {
+  return normalize(path.startsWith('/') ? path : `${base}/${path}`)
+}
+
+/** Folders Braun may always write: what is there is nobody's. The session scratchpad lives under them. */
+export function inScratch(path: string, ctx: Pick<PathContext, 'tmpdir'>): boolean {
+  const roots = ['/tmp', '/private/tmp', ...(ctx.tmpdir ? [normalize(ctx.tmpdir)] : [])]
+  return roots.some(root => root !== '/' && (path === root || path.startsWith(`${root}/`)))
+}
+
+/** A variable, a substitution or a glob pattern: what the word names is only known when the shell runs it. */
+const UNRESOLVED = /[$`*?[]/
+
+/** `~`, `$HOME` and `$TMPDIR` replaced by their values, where known. */
+function expand(word: string, ctx: PathContext): string {
+  let out = word
+  if (ctx.home !== undefined && (out === '~' || out.startsWith('~/'))) out = ctx.home + out.slice(1)
+  for (const [name, value] of [['HOME', ctx.home], ['TMPDIR', ctx.tmpdir]] as const) {
+    if (value !== undefined) out = out.replace(new RegExp(`\\$(?:${name}\\b|\\{${name}\\})`, 'g'), () => value)
+  }
+  return out
+}
+
+/** Where `word` leads from `base`, when it is literal once expanded. */
+function literalPath(word: string, base: string | undefined, ctx: PathContext): string | undefined {
+  const expanded = expand(word, ctx)
+  if (expanded.startsWith('~') || UNRESOLVED.test(expanded)) return undefined
+  if (expanded.startsWith('/')) return normalize(expanded)
+  return base === undefined ? undefined : resolvePath(base, expanded)
+}
+
+/**
+ * Where `word` leads from `base` (undefined after a `cd` the plugin cannot follow), or why it cannot be known. A word
+ * with a variable or a pattern is accepted only when its literal folder is already a scratch one: the path is then
+ * that folder.
+ */
+export function resolveWord(word: string, base: string | undefined, ctx: PathContext): { path: string } | { problem: string } {
+  const literal = literalPath(word, base, ctx)
+  if (literal !== undefined) return { path: literal }
+  const expanded = expand(word, ctx)
+  const cut = expanded.startsWith('~') ? 0 : expanded.search(UNRESOLVED)
+  if (cut < 0) return { problem: `${word} (relative to a directory the plugin cannot follow)` }
+  const folder = expanded.slice(0, expanded.lastIndexOf('/', cut) + 1)
+  const rest = expanded.slice(folder.length)
+  const from = folder.startsWith('/') ? normalize(folder) : base === undefined ? undefined : resolvePath(base, folder || '.')
+  if (from !== undefined && inScratch(from, ctx) && !/(^|\/)\.\.(\/|$)/.test(rest)) return { path: from }
+  return { problem: `${word} (it holds a variable or a pattern, so the plugin cannot check it)` }
+}
+
+/** A glob as a regular expression: `*` and `?` within one path segment, `**` across any depth. */
+function globPattern(glob: string): RegExp {
+  let source = ''
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]!
+    if (c === '*' && glob[i + 1] === '*') {
+      if (glob[i + 2] === '/') {
+        source += '(?:.*/)?'
+        i += 2
+      } else if (i + 2 === glob.length && source.endsWith('/')) {
+        // `dir/**` also names `dir` itself.
+        source = `${source.slice(0, -1)}(?:/.*)?`
+        i += 1
+      } else {
+        source += '.*'
+        i += 1
+      }
+    } else if (c === '*') source += '[^/]*'
+    else if (c === '?') source += '[^/]'
+    else source += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`^${source}$`)
+}
+
+/** Whether `path` (absolute) matches one of the brief's globs, each relative to `root` or absolute. */
+export function allowedPath(path: string, globs: readonly string[], root: string): boolean {
+  return globs.some(glob => globPattern(glob.startsWith('/') ? glob : `${root}/${glob.replace(/^(\.\/)+/, '')}`).test(path))
+}
+
+// --- Braun: installs ----------------------------------------------------
+
+const READ_ONLY_PACKAGES = new Set(['list', 'search', 'show', 'info', 'policy', 'madison', 'depends', 'rdepends', 'provides', 'help'])
+
+/** Why this command installs outside the project (globally, for the user or into the system), or undefined. */
+export function globalInstall(argv: readonly string[]): string | undefined {
+  const program = basename(argv[0] ?? '')
+  const args = argv.slice(1)
+  const named = args.filter(a => !a.startsWith('-'))
+  const [sub, second] = named
+  const has = (...flags: string[]) => args.some(a => flags.includes(a))
+  const inVenv = /(^|\/)[^/]*venv[^/]*\/bin\//.test(argv[0] ?? '')
+
+  if ((program === 'npm' || program === 'pnpm' || program === 'bun') && (has('-g', '--global', '--location=global')) &&
+    (INSTALLERS[program] as readonly string[]).includes(sub ?? ''))
+    return `${program} ${sub} --global`
+  if (program === 'yarn' && sub === 'global' && !['list', 'bin', 'dir'].includes(second ?? '')) return 'yarn global'
+  const pip = /^pip[\d.]*$/.test(program) ? { sub } :
+    /^python[\d.]*$/.test(program) && args[args.indexOf('-m') + 1] === 'pip' && args.includes('-m')
+      ? { sub: args.slice(args.indexOf('-m') + 2).find(a => !a.startsWith('-')) }
+      : undefined
+  if (pip !== undefined && (pip.sub === 'install' || pip.sub === 'uninstall')) {
+    if (has('--user')) return `pip ${pip.sub} --user`
+    if (!inVenv) return `pip ${pip.sub} outside a virtual environment`
+  }
+  if (program === 'uv') {
+    if (sub === 'pip' && has('--system')) return 'uv pip --system'
+    if ((sub === 'tool' || sub === 'python') && ['install', 'uninstall', 'upgrade'].includes(second ?? '')) return `uv ${sub} ${second}`
+  }
+  if (program === 'pipx' && sub !== undefined && !['run', 'list', 'environment'].includes(sub)) return `pipx ${sub}`
+  if (program === 'cargo' && (sub === 'install' || sub === 'uninstall')) return `cargo ${sub}`
+  if (program === 'go' && sub === 'install') return 'go install'
+  if (program === 'gem' && ['install', 'uninstall', 'update'].includes(sub ?? '')) return `gem ${sub}`
+  if (['apt', 'apt-get', 'dnf', 'yum'].includes(program) && sub !== undefined && !READ_ONLY_PACKAGES.has(sub)) return `${program} ${sub}`
+  if (program === 'pacman' && args.some(a => /^--(sync|remove|upgrade)$/.test(a) || /^-[SRU]/.test(a) && !/^-S[sigl]+$/.test(a)))
+    return 'pacman (installing or removing)'
+  if (program === 'brew' && ['install', 'uninstall', 'remove', 'rm', 'upgrade', 'reinstall', 'tap', 'untap', 'link', 'unlink'].includes(sub ?? ''))
+    return `brew ${sub}`
+  if (program === 'snap' && ['install', 'remove', 'refresh', 'revert'].includes(sub ?? '')) return `snap ${sub}`
+  if (['conda', 'mamba', 'micromamba'].includes(program) && ['install', 'create', 'remove', 'uninstall', 'update', 'upgrade'].includes(sub ?? ''))
+    return `${program} ${sub}`
+  return undefined
+}
+
+/** Whether a command prefix the brief allows matches `words`, word by word. */
+export function allowedCommand(words: readonly string[], prefixes: readonly string[]): boolean {
+  return prefixes.some(prefix => {
+    const want = prefix.trim().split(/\s+/)
+    return want[0] !== '' && want.length <= words.length && want.every((w, k) => words[k] === w)
+  })
+}
+
+// --- Braun: what a command writes ---------------------------------------
+
+/** Programs that remove the paths they name (mv its sources). */
+const REMOVERS = new Set(['rm', 'rmdir', 'unlink', 'shred', 'mv'])
+
+const RSYNC_VALUED = ['-e', '--rsh', '-f', '--filter', '-T', '--temp-dir', '--exclude', '--include', '--exclude-from', '--include-from',
+  '--files-from', '--port', '--log-file', '--partial-dir', '--backup-dir', '--compare-dest', '--copy-dest', '--link-dest', '--chmod', '--chown']
+
+/** The operands of a command, and the values of the options that take one (`valued`, or any `--name=value`). */
+function operands(args: readonly string[], valued: readonly string[] = []): { list: string[]; value: (...flags: string[]) => string | undefined } {
+  const list: string[] = []
+  const values = new Map<string, string>()
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k]!
+    if (a === '--') {
+      list.push(...args.slice(k + 1))
+      break
+    }
+    if (a.startsWith('--') && a.includes('=')) values.set(a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1))
+    else if (a.startsWith('-') && a !== '-') {
+      if (valued.includes(a)) values.set(a, args[++k] ?? '')
+    } else list.push(a)
+  }
+  return { list, value: (...flags) => flags.map(f => values.get(f)).find(v => v !== undefined) }
+}
+
+/** The files `sed -i` or `perl -i` edits in place (the operands past the script, unless -e gives it); undefined when not in place. */
+function inPlaceFiles(args: readonly string[], program: 'sed' | 'perl'): string[] | undefined {
+  const script = program === 'sed' ? 'ef' : 'eE'
+  const valued = program === 'sed' ? 'efl' : 'eEMmI'
+  const digits = program === 'sed' ? '' : 'l0'
+  const restOnly = program === 'sed' ? '' : 'xCdD'
+  let inPlace = false
+  let hasScript = false
+  const files: string[] = []
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k]!
+    if (a === '--') {
+      files.push(...args.slice(k + 1))
+      break
+    }
+    if (a.startsWith('--')) {
+      if (a.startsWith('--in-place')) inPlace = true
+      else if (/^--(expression|file)(=|$)/.test(a)) {
+        hasScript = true
+        if (!a.includes('=')) k++
+      } else if (a === '--line-length') k++
+      continue
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      for (let j = 1; j < a.length; j++) {
+        const f = a[j]!
+        if (f === 'i') {
+          inPlace = true // the rest is a backup suffix
+          break
+        }
+        if (valued.includes(f)) {
+          if (script.includes(f)) hasScript = true
+          if (j + 1 === a.length) k++
+          break
+        }
+        if (restOnly.includes(f)) break
+        // perl's -0 and -l take digits of their own, attached.
+        if (digits.includes(f)) while (/\d/.test(a[j + 1] ?? '')) j++
+      }
+      continue
+    }
+    files.push(a)
+  }
+  if (!inPlace) return undefined
+  return hasScript ? files : files.slice(1)
+}
+
+type Named = { word: string; op: Operation; sources?: string[] }
+
+/** What one simple command writes or removes, by the words it names them with. */
+function namedTargets(argv: readonly string[], redirects: readonly string[]): Named[] {
+  const found: Named[] = []
+  const write = (words: readonly string[], sources?: string[]) =>
+    found.push(...words.map(word => (sources === undefined ? { word, op: 'write' as const } : { word, op: 'write' as const, sources })))
+  const remove = (words: readonly string[]) => found.push(...words.map(word => ({ word, op: 'remove' as const })))
+
+  write(redirects.filter(r => !r.startsWith('&') && !SAFE_REDIRECTS.has(r)))
+  const program = basename(argv[0] ?? '')
+  const args = argv.slice(1)
+  switch (program) {
+    case 'tee':
+      write(operands(args).list.filter(p => !SAFE_REDIRECTS.has(p)))
+      break
+    case 'sed': case 'perl':
+      write(inPlaceFiles(args, program) ?? [])
+      break
+    case 'cp': case 'mv': case 'ln': case 'install': {
+      const { list, value } = operands(args, ['-t', '--target-directory', '-S', '--suffix',
+        ...(program === 'install' ? ['-m', '--mode', '-o', '--owner', '-g', '--group'] : [])])
+      if (program === 'install' && (args.includes('-d') || args.includes('--directory'))) {
+        write(list)
+        break
+      }
+      const folder = value('-t', '--target-directory')
+      if (folder !== undefined) {
+        if (program === 'mv') remove(list)
+        write([folder], list)
+      } else if (program === 'ln' && list.length === 1) write([basename(list[0]!)])
+      else if (list.length >= 2) {
+        if (program === 'mv') remove(list.slice(0, -1))
+        write([list.at(-1)!], list.slice(0, -1))
+      }
+      break
+    }
+    case 'mkdir':
+      write(operands(args, ['-m', '--mode']).list)
+      break
+    case 'touch':
+      write(operands(args, ['-r', '--reference', '-d', '--date', '-t']).list)
+      break
+    case 'truncate':
+      write(operands(args, ['-s', '--size', '-r', '--reference']).list)
+      break
+    case 'chmod': case 'chown': case 'chgrp': {
+      const { list, value } = operands(args)
+      // The first operand is the mode or owner, unless --reference gives it (or, for chmod, a mode like `-x` does).
+      const given = value('--reference') !== undefined || program === 'chmod' && args.some(a => /^-[rwxXst]+$/.test(a))
+      write(given ? list : list.slice(1))
+      break
+    }
+    case 'dd':
+      write(args.filter(a => a.startsWith('of=')).map(a => a.slice(3)))
+      break
+    case 'rsync': {
+      const { list } = operands(args, RSYNC_VALUED)
+      const local = (p: string) => !/^[^/]*:/.test(p)
+      if (list.length < 2) break
+      const sources = list.slice(0, -1).filter(local)
+      if (args.includes('--remove-source-files')) remove(sources)
+      if (local(list.at(-1)!)) write([list.at(-1)!], sources)
+      break
+    }
+    case 'rm': case 'rmdir': case 'unlink':
+      remove(operands(args).list)
+      break
+    case 'shred':
+      remove(operands(args, ['-n', '--iterations', '-s', '--size', '--random-source']).list)
+      break
+  }
+  return found
+}
+
+// --- the Bash check -----------------------------------------------------
+
+function analyse(command: string, role: Role, verdict: BashVerdict, depth: number, ctx: PathContext, start: string | undefined): void {
+  // Where relative paths start from: the session's directory, moved by each literal `cd` on this command line.
+  let base = start
   for (const { words, redirects } of parse(command)) {
     if (verdict.deny !== undefined) return
-    const { argv, viaXargs } = unwrap(words)
+    const { argv, viaXargs, privileged } = unwrap(words)
     const program = basename(argv[0] ?? '')
     const args = argv.slice(1)
 
     // Shells and eval run a string of their own.
     if (depth < 3 && /^(ba|z|da|k)?sh$/.test(program) && args.includes('-c')) {
-      analyse(args[args.indexOf('-c') + 1] ?? '', role, verdict, depth + 1)
+      analyse(args[args.indexOf('-c') + 1] ?? '', role, verdict, depth + 1, ctx, base)
       continue
     }
     if (depth < 3 && program === 'eval') {
-      analyse(args.join(' '), role, verdict, depth + 1)
+      analyse(args.join(' '), role, verdict, depth + 1, ctx, base)
       continue
     }
     // find's -exec runs a command of its own; -delete deletes.
@@ -302,7 +620,7 @@ function analyse(command: string, role: Role, verdict: BashVerdict, depth: numbe
         const end = args.findIndex((a, k) => k > exec && (a === ';' || a === '+'))
         const inner = unwrap(args.slice(exec + 1, end < 0 ? undefined : end)).argv
         const innerProgram = basename(inner[0] ?? '')
-        if (role === 'braun' && (innerProgram === 'rm' || innerProgram === 'mv')) {
+        if (role === 'braun' && REMOVERS.has(innerProgram)) {
           verdict.deny = `find -exec ${innerProgram} (its targets cannot be checked against git)`
           return
         }
@@ -333,37 +651,94 @@ function analyse(command: string, role: Role, verdict: BashVerdict, depth: numbe
       continue
     }
 
-    // Braun: may write the working tree, but not .git, and may not delete or move tracked files.
-    const intoGit = redirects.find(touchesGitDir)
-    if (intoGit !== undefined) {
-      verdict.deny = `writing into ${intoGit}`
+    // Braun: no sudo and no global installs unless the brief allows them; every path written or removed is collected.
+    const permitted = allowedCommand(words, ctx.allowCommands ?? []) || allowedCommand(argv, ctx.allowCommands ?? [])
+    if (privileged !== undefined && !permitted) {
+      verdict.deny = `${privileged} (allowed only when the brief allows it)`
       return
     }
-    if (program === 'rm' || program === 'mv' || program === 'unlink' || program === 'rmdir') {
-      let paths = positionals(args)
-      if (program === 'mv') {
-        const t = args.findIndex(a => a === '-t' || a.startsWith('--target-directory'))
-        paths = t >= 0 ? paths.filter(p => p !== args[t + 1]) : paths.slice(0, -1)
-      }
-      if (viaXargs) {
-        verdict.deny = `${program} through xargs (its targets cannot be checked against git)`
+    const install = globalInstall(argv)
+    if (install !== undefined && !permitted) {
+      verdict.deny = `${install} (a global or system install, allowed only when the brief allows it)`
+      return
+    }
+    if (program === 'cd' || program === 'pushd') {
+      const dir = operands(args).list[0]
+      base = dir === '-' ? undefined : literalPath(dir ?? '~', base, ctx)
+      continue
+    }
+    if (program === 'popd') {
+      base = undefined
+      continue
+    }
+    if (viaXargs && REMOVERS.has(program)) {
+      verdict.deny = `${program} through xargs (its targets cannot be checked against git)`
+      return
+    }
+    for (const { word, op, sources } of namedTargets(argv, redirects)) {
+      const resolved = resolveWord(word, base, ctx)
+      if ('problem' in resolved) {
+        verdict.deny = `${op === 'write' ? 'writing' : 'removing'} ${resolved.problem}`
         return
       }
-      const gitPath = paths.find(touchesGitDir)
-      if (gitPath !== undefined) {
-        verdict.deny = `${program} ${gitPath}`
-        return
-      }
-      verdict.mustBeUntracked.push(...paths)
+      verdict.targets.push(sources === undefined ? { path: resolved.path, op } : { path: resolved.path, op, sources })
     }
   }
 }
 
-/** Checks a Bash command for a role: a refusal, or paths that must turn out untracked. */
-export function checkBash(command: string, role: Role): BashVerdict {
-  const verdict: BashVerdict = { mustBeUntracked: [] }
-  analyse(command, role, verdict, 0)
+/**
+ * Checks a Bash command for a role: a refusal, or (Braun) the absolute paths it writes and removes, for the plugin to
+ * check against git. `ctx` resolves Braun's paths.
+ */
+export function checkBash(command: string, role: Role, ctx: PathContext = { cwd: '/' }): BashVerdict {
+  const verdict: BashVerdict = { targets: [] }
+  analyse(command, role, verdict, 0, ctx, ctx.cwd)
   return verdict
+}
+
+// --- Braun: may this path be written or removed? ------------------------
+
+/**
+ * What the plugin knows about a path Braun writes or removes. For a directory being removed, `tracked`, `dirty` and
+ * `untrackedAtStart` also hold when they hold for a file inside it; for a write, they are about the path itself.
+ */
+export type PathFacts = {
+  /** Under /tmp, /private/tmp or $TMPDIR. */
+  scratch: boolean
+  /** Matched by the brief's `allow.paths`. */
+  allowed: boolean
+  /** Inside a .git folder. */
+  inGit: boolean
+  /** Outside the project root. */
+  outside: boolean
+  /** Gitignored (git never reports a tracked file as ignored). */
+  ignored: boolean
+  tracked: boolean
+  /** Has uncommitted changes, staged or not. */
+  dirty: boolean
+  /** Was untracked when the run started. */
+  untrackedAtStart: boolean
+  directory: boolean
+  /** A directory holding gitignored files. */
+  holdsIgnored: boolean
+}
+
+/** Why Braun may not write or remove `path`, or undefined: the decision order the user agreed. */
+export function decide(path: string, op: Operation, f: PathFacts): string | undefined {
+  const verb = op === 'write' ? 'writing' : 'removing'
+  if (f.scratch || f.allowed) return undefined
+  if (f.inGit) return `${verb} ${path} (inside .git)`
+  if (f.outside) return `${verb} ${path} (outside the project)`
+  if (f.ignored) return `${verb} ${path} (gitignored, so git cannot restore it)`
+  if (f.tracked) {
+    if (op === 'write') return undefined
+    if (f.dirty) return `removing ${path} (it has uncommitted changes git cannot restore)`
+    if (f.directory && (f.holdsIgnored || f.untrackedAtStart)) return `removing ${path} (it holds untracked or ignored files git cannot restore)`
+    return undefined
+  }
+  if (f.untrackedAtStart) return `${verb} ${path} (untracked since before this run, so git cannot restore it)`
+  if (op === 'remove' && f.directory && f.holdsIgnored) return `removing ${path} (it holds gitignored files git cannot restore)`
+  return undefined
 }
 
 /** Checks a file-writing tool call for a role. */

@@ -1,11 +1,15 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Mode } from '../types'
+import type { Allow, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
-import { checkBash, checkEdit, EDIT_TOOLS, styleArgMode, THREAD_TOOLS, type Role } from './rules'
+import {
+  allowedPath, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesGitDir,
+  type Operation, type PathFacts, type Role, type Target,
+} from './rules'
 
 const MODE = { plugin: 'pauli-braun', key: 'mode' } as const
 const HANDED_OFF = { plugin: 'pauli-braun', key: 'handedOff' } as const
+const RUN = { plugin: 'pauli-braun', key: 'run' } as const
 
 const HANDOFF_TOOL = 'mcp__pauli-braun__handoff'
 
@@ -13,12 +17,14 @@ const STYLE: Record<Role, string> = { pauli: 'pauli-braun:pauli', braun: 'pauli-
 const NAME: Record<Role, string> = { pauli: 'Pauli', braun: 'Braun' }
 const STATUS: Record<Role, string> = {
   pauli: 'Pauli · discuss & review, no edits',
-  braun: 'Braun · build, no git changes',
+  braun: 'Braun · build what git can restore, no git changes',
 }
 const ADVICE: Record<Role, string> = {
   pauli: 'Pauli reads and runs side-effect-free commands only; propose the change and let the user hand off to Braun.',
-  braun: 'Version control is the user\'s: leave it as it is and mention what you would have done in your report. ' +
-    'To stage finished work and prepare its commit message, pass "commit" to the hand-off (pauli-braun:report).',
+  braun: 'Braun changes only what git can restore (tracked files, new files in the project), the scratch folders ' +
+    '(/tmp, $TMPDIR) and what the brief allows; version control is the user\'s. Leave it as it is and mention what ' +
+    'you would have done in your report. To stage finished work and prepare its commit message, pass "commit" to the ' +
+    'hand-off (pauli-braun:report).',
 }
 const KICKOFF: Record<Role, string> = {
   braun: 'Braun, Pauli has handed off to you: carry out the latest "Brief for Braun" above.',
@@ -39,19 +45,111 @@ async function currentMode($: EngineInterface): Promise<Mode> {
   return modeOf(typeof outputStyle === 'string' ? outputStyle : undefined)
 }
 
-/** Records the mode and shows it on the status line, when it changed. */
+/** Records the mode and shows it on the status line, when it changed; leaving Braun mode ends the Braun run. */
 async function applyMode($: EngineInterface, mode: Mode): Promise<void> {
   const { value } = await $.state.get(MODE)
   if (value !== mode) {
     await $.state.set(MODE, mode)
     $.ui.status(mode === 'off' ? undefined : STATUS[mode])
+    if (value === 'braun') await $.state.set(RUN, null)
   }
 }
 
-/** The paths among `paths` that git tracks; none outside a repository. */
-async function trackedAmong($: EngineInterface, paths: string[]): Promise<string[]> {
-  const { exitCode, stdout } = await $.process.run(['git', 'ls-files', '-z', '--', ...paths])
-  return exitCode === 0 ? stdout.split('\0').filter(Boolean) : []
+/** The hand-off's `allow`, checked: what the brief allows Braun beyond the defaults. */
+function readAllow(allow: unknown): Allow | { problem: string } {
+  if (allow === undefined) return { paths: [], commands: [] }
+  if (typeof allow !== 'object' || allow === null || Array.isArray(allow)) return { problem: '"allow" must be an object' }
+  const list = (v: unknown) =>
+    v === undefined ? [] : Array.isArray(v) && v.every(x => typeof x === 'string' && x.trim() !== '') ? (v as string[]) : undefined
+  const { paths, commands } = allow as Record<string, unknown>
+  const [p, c] = [list(paths), list(commands)]
+  if (p === undefined || c === undefined) return { problem: '"allow.paths" and "allow.commands" must be lists of non-empty strings' }
+  return { paths: p, commands: c }
+}
+
+/** Starts a Braun run: the repository's root and its untracked files now, and what the brief allows. */
+async function startRun($: EngineInterface, allow: Allow): Promise<{ problem: string } | undefined> {
+  const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
+  if (top.exitCode !== 0) return { problem: 'this folder is not in a git repository, so nothing Braun changes could be restored' }
+  const root = top.stdout.trim()
+  const untracked = await $.process.run(['git', 'ls-files', '-z', '--others', '--exclude-standard'], { cwd: root })
+  if (untracked.exitCode !== 0) return { problem: `git ls-files failed: ${untracked.stderr.trim()}` }
+  await $.state.set(RUN, { root, allow, untrackedAtStart: untracked.stdout.split('\0').filter(Boolean) })
+  return undefined
+}
+
+const NOTHING_KNOWN: PathFacts = {
+  scratch: false, allowed: false, inGit: false, outside: false, ignored: false, tracked: false, dirty: false,
+  untrackedAtStart: false, directory: false, holdsIgnored: false,
+}
+
+/** Why Braun may not write or remove these paths, with what git knows about each; undefined when all may go. */
+async function braunRefusal($: EngineInterface, run: Run, targets: readonly Target[], tmpdir: string | undefined): Promise<string | undefined> {
+  const kind = async (path: string) => (await $.fs.stat(path).catch(() => undefined))?.kind
+  const free = (path: string) => inScratch(path, { tmpdir }) || allowedPath(path, run.allow.paths, run.root)
+
+  // A cp, mv, ln, install or rsync into a directory writes the sources' names inside it.
+  const checks: { path: string; op: Operation }[] = []
+  for (const target of targets) {
+    if (target.sources === undefined || target.sources.length === 0 || (await kind(target.path)) !== 'dir') {
+      checks.push(target)
+      continue
+    }
+    for (const source of target.sources) {
+      const name = source.replace(/\/+$/, '').slice(source.replace(/\/+$/, '').lastIndexOf('/') + 1)
+      if (['', '.', '..'].includes(name) || /[$`*?[]/.test(name)) {
+        if (free(target.path)) continue
+        return `writing into ${target.path} (what lands there from ${source} cannot be checked)`
+      }
+      checks.push({ path: `${target.path}/${name}`, op: 'write' })
+    }
+  }
+
+  // The first rows of the decision need no git.
+  const inside: { path: string; op: Operation; rel: string }[] = []
+  for (const { path, op } of checks) {
+    const facts = { ...NOTHING_KNOWN, scratch: inScratch(path, { tmpdir }), allowed: allowedPath(path, run.allow.paths, run.root),
+      inGit: touchesGitDir(path), outside: path !== run.root && !path.startsWith(`${run.root}/`) }
+    if (facts.scratch || facts.allowed || facts.inGit || facts.outside) {
+      const why = decide(path, op, facts)
+      if (why !== undefined) return why
+    } else inside.push({ path, op, rel: path === run.root ? '.' : path.slice(run.root.length + 1) })
+  }
+  if (inside.length === 0) return undefined
+
+  const git = async (args: string[], stdin?: string) => {
+    const ran = await $.process.run(['git', ...args], { cwd: run.root, ...(stdin === undefined ? {} : { stdin }) })
+    // check-ignore exits 1 when nothing is ignored.
+    if (ran.exitCode !== 0 && !(args[0] === 'check-ignore' && ran.exitCode === 1))
+      throw new Error(`git ${args[0] === '--literal-pathspecs' ? args[1] : args[0]} failed: ${ran.stderr.trim()}`)
+    return ran.stdout
+  }
+  const split = (out: string) => out.split('\0').filter(Boolean)
+  const rels = [...new Set(inside.map(c => c.rel))]
+  const removed = [...new Set(inside.filter(c => c.op === 'remove').map(c => c.rel))]
+  // check-ignore takes paths, not pathspecs: no --literal-pathspecs, which it refuses.
+  const ignored = new Set(split(await git(['check-ignore', '-z', '--stdin'], `${rels.join('\0')}\0`)))
+  const tracked = split(await git(['--literal-pathspecs', 'ls-files', '-z', '--', ...rels]))
+  const dirty = removed.length === 0 ? [] :
+    statusPaths(await git(['--literal-pathspecs', 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--', ...removed]))
+
+  for (const { path, op, rel } of inside) {
+    const under = (p: string) => rel === '.' || p === rel || p.startsWith(`${rel}/`)
+    const directory = op === 'remove' && (await kind(path)) === 'dir'
+    const holdsIgnored = directory &&
+      split(await git(['--literal-pathspecs', 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory', '--', rel])).length > 0
+    const why = decide(path, op, {
+      ...NOTHING_KNOWN,
+      ignored: ignored.has(rel),
+      tracked: directory ? tracked.some(under) : tracked.includes(rel),
+      dirty: directory ? dirty.some(under) : dirty.includes(rel),
+      untrackedAtStart: directory ? run.untrackedAtStart.some(under) : run.untrackedAtStart.includes(rel),
+      directory,
+      holdsIgnored,
+    })
+    if (why !== undefined) return why
+  }
+  return undefined
 }
 
 const IN_PROGRESS = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply']
@@ -128,7 +226,8 @@ export const register: Register = on => {
         'with to="pauli" right after writing its report (the report skill). The output style switches when the ' +
         'current turn ends and the other role starts on its own, so end your turn right after calling it. ' +
         'Braun handing back done work may pass "commit": the plugin stages those paths and writes the message to ' +
-        'SQUASH_MSG, where VS Code shows it as the commit message; if that fails, the hand-off is refused with the reason.',
+        'SQUASH_MSG, where VS Code shows it as the commit message; if that fails, the hand-off is refused with the reason. ' +
+        'Pauli handing off may pass "allow": what the brief allows Braun beyond the defaults, for this run only.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -149,13 +248,28 @@ export const register: Register = on => {
             },
             required: ['paths', 'message'],
           },
+          allow: {
+            type: 'object',
+            description: 'Only Pauli, handing off to Braun: the brief\'s "Allowed beyond the defaults", enforced for this run only.',
+            properties: {
+              paths: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Globs (`*`, `**`, `?`), relative to the repository root or absolute, Braun may write and remove.',
+              },
+              commands: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Command prefixes, matched word by word, Braun may run although they install globally or use sudo.',
+              },
+            },
+          },
         },
         required: ['to'],
       },
       isDeferred: false,
     })
     await $.command.register({ name: 'pauli', description: 'Switch to Pauli mode: discuss, plan and review, no edits' })
-    await $.command.register({ name: 'braun', description: 'Switch to Braun mode: build, no git changes' })
     await $.command.register({ name: 'pb-off', description: 'Leave Pauli/Braun mode (back to the default output style)' })
     await $.command.register({
       name: 'handoff',
@@ -187,8 +301,9 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: HANDOFF_TOOL }, async ($, e) => {
-    const { to, commit } = e as unknown as { to?: unknown; commit?: unknown }
+    const { to, commit, allow } = e as unknown as { to?: unknown; commit?: unknown; allow?: unknown }
     if (to !== 'pauli' && to !== 'braun') return { deny: 'pauli-braun: "to" must be "pauli" or "braun".' }
+    if (allow !== undefined && to !== 'braun') return { deny: 'pauli-braun: only a hand-off to Braun takes "allow".' }
     const mode = await currentMode($)
     if (mode === to) return { result: `The session is already in ${NAME[to]} mode; nothing to switch.` }
 
@@ -204,6 +319,17 @@ export const register: Register = on => {
       prepared = ` ${outcome.done}`
     }
 
+    // A hand-off to Braun starts a run: what git can restore is measured now, and the brief's allowances recorded.
+    let allowed = ''
+    if (to === 'braun') {
+      const read = readAllow(allow)
+      if ('problem' in read) return { deny: `pauli-braun: no hand-off: ${read.problem}.` }
+      const problem = await startRun($, read).catch(err => ({ problem: String(err) }))
+      if (problem !== undefined) return { deny: `pauli-braun: no hand-off: ${problem.problem}.` }
+      if (read.paths.length + read.commands.length > 0)
+        allowed = ` Allowed beyond the defaults for this run: ${[...read.paths, ...read.commands.map(c => `\`${c}\``)].join(', ')}.`
+    }
+
     await $.state.set(HANDED_OFF, true)
     later($, `the hand-off to ${NAME[to]}`, async () => {
       await switchStyle($, STYLE[to])
@@ -211,7 +337,7 @@ export const register: Register = on => {
     })
     return {
       result: `Hand-off to ${NAME[to]} scheduled: the output style switches to ${STYLE[to]} when this turn ends, ` +
-        `and ${NAME[to]} starts on its own.${prepared} End your turn now, with no further tool calls.`,
+        `and ${NAME[to]} starts on its own.${prepared}${allowed} End your turn now, with no further tool calls.`,
     }
   })
 
@@ -219,11 +345,6 @@ export const register: Register = on => {
   on('command.run', { command: 'pauli' }, async $ => {
     later($, 'switching to Pauli', () => switchStyle($, STYLE.pauli))
     return { text: 'Switching to Pauli mode.' }
-  })
-
-  on('command.run', { command: 'braun' }, async $ => {
-    later($, 'switching to Braun', () => switchStyle($, STYLE.braun))
-    return { text: 'Switching to Braun mode.' }
   })
 
   on('command.run', { command: 'pb-off' }, async $ => {
@@ -252,17 +373,43 @@ export const register: Register = on => {
     const input = e as unknown as Record<string, unknown>
 
     if (THREAD_TOOLS.has(tool)) return refuse(`${tool} (everything stays in this one thread)`)
+    const path = String(input.file_path ?? input.notebook_path ?? '')
+    const command = String(input.command ?? '')
+    if (mode === 'pauli') {
+      if (EDIT_TOOLS.has(tool)) {
+        const why = checkEdit(tool, path, mode)
+        if (why !== undefined) return refuse(why)
+      }
+      if (tool === 'Bash') {
+        const verdict = checkBash(command, mode)
+        if (verdict.deny !== undefined) return refuse(verdict.deny)
+      }
+      return next(e)
+    }
+
+    // Braun works only within a run, which /handoff starts; without one, only what Pauli may do.
+    const { value: run } = await $.state.get(RUN)
+    if (run === undefined || run === null) {
+      const why = EDIT_TOOLS.has(tool) ? tool : tool === 'Bash' ? checkBash(command, 'pauli').deny : undefined
+      return why === undefined
+        ? next(e)
+        : { deny: `pauli-braun (Braun mode): ${why} is blocked: there is no Braun run. Start Braun with /handoff.` }
+    }
+    const ctx = { cwd: await $.session.cwd(), home: await $.env.get('HOME'), tmpdir: await $.env.get('TMPDIR'), allowCommands: run.allow.commands }
+    let targets: Target[] = []
     if (EDIT_TOOLS.has(tool)) {
-      const why = checkEdit(tool, String(input.file_path ?? input.notebook_path ?? ''), mode)
+      const why = checkEdit(tool, path, mode)
       if (why !== undefined) return refuse(why)
+      targets = [{ path: resolvePath(ctx.cwd, path), op: 'write' }]
     }
     if (tool === 'Bash') {
-      const verdict = checkBash(String(input.command ?? ''), mode)
+      const verdict = checkBash(command, mode, ctx)
       if (verdict.deny !== undefined) return refuse(verdict.deny)
-      if (verdict.mustBeUntracked.length > 0) {
-        const tracked = await trackedAmong($, verdict.mustBeUntracked)
-        if (tracked.length > 0) return refuse(`deleting or moving tracked files (${tracked.slice(0, 5).join(', ')})`)
-      }
+      targets = verdict.targets
+    }
+    if (targets.length > 0) {
+      const why = await braunRefusal($, run, targets, ctx.tmpdir).catch(err => `checking what it changes (${String(err)})`)
+      if (why !== undefined) return refuse(why)
     }
     return next(e)
   }).catch(($, e, next) =>
