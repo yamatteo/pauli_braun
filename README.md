@@ -62,12 +62,28 @@ The delegated Braun's model and effort, by default the session's:
 | `braunModel` | `inherit`, `haiku`, `sonnet`, `opus` | `inherit` (the session's model) |
 | `braunEffort` | `inherit`, `low`, `medium`, `high`, `xhigh`, `max` | `inherit` (the session's effort) |
 
-Set them in `/config` in a terminal session (a change reloads the plugin, and the next `/delegate` uses it), on the
-install screen, or in a settings file:
+In a session, run `/plugin configure pauli-braun@pauli-braun` (or `/plugin`, Installed tab, the plugin, **Configure options**). `pauli-braun@pauli-braun` is the plugin ID when the marketplace is added as above;
+if you added it under another name, use the ID `claude plugin list` shows.
+
+From the shell, `claude plugin configure pauli-braun@pauli-braun` lists the options and whether each is set, and `--values-stdin` saves values (it needs the full ID):
+
+```sh
+echo '{"braunModel":"sonnet","braunEffort":"high"}' | claude plugin configure pauli-braun@pauli-braun --values-stdin
+```
+
+At install time, pass `--config` once per option:
+
+```sh
+claude plugin install pauli-braun@pauli-braun --config braunModel=sonnet --config braunEffort=high
+```
+
+Or edit `~/.claude/settings.json` by hand:
 
 ```json
-{ "pluginConfigs": { "pauli-braun": { "options": { "braunModel": "sonnet", "braunEffort": "high" } } } }
+{ "pluginConfigs": { "pauli-braun@pauli-braun": { "options": { "braunModel": "sonnet", "braunEffort": "high" } } } }
 ```
+
+Restart Claude Code to apply a change. Project (`.claude/settings.json`) and local settings are ignored for plugin options: a cloned repository must not be able to supply them.
 
 They don't touch `/handoff`: in-thread Braun runs on whatever the session runs on.
 
