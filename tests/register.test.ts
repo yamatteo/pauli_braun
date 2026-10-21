@@ -9,7 +9,11 @@ const WRITE_NEW = { tool: 'Write', file_path: '/repo/new.txt', content: 'x' } as
  * run, tool calls that succeed, and `agents` as the session's agent list (each `running` unless it says otherwise).
  * Returns what was submitted as prompts, and the toasts shown.
  */
-function world(on: On, agents: { id: string; type: string; status?: AgentStatus }[] = []) {
+function world(
+  on: On,
+  agents: { id: string; type: string; status?: AgentStatus }[] = [],
+  files: Record<string, { kind: 'file' | 'dir'; realPath?: string; isLink?: boolean; dangling?: boolean }> = {},
+) {
   const prompts: string[] = []
   const toasts: string[] = []
   const clock = mock.clock(on)
@@ -23,6 +27,19 @@ function world(on: On, agents: { id: string; type: string; status?: AgentStatus 
   on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', status: a.status ?? 'running' })) }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
+  // The file system: /repo, the scratch folders and what `files` lists (each resolving to itself unless it says otherwise,
+  // a dangling link not at all); the rest is missing.
+  const known: typeof files = { '/repo': { kind: 'dir' }, '/tmp': { kind: 'dir' }, '/var/tmp/x': { kind: 'dir' }, ...files }
+  on('fs.list', (_$, e) => ({
+    value: Object.entries(known)
+      .filter(([path]) => path.slice(0, path.lastIndexOf('/')) === e.path.replace(/\/+$/, ''))
+      .map(([path, f]) => ({ name: path.slice(path.lastIndexOf('/') + 1), kind: f.isLink ? 'other' : f.kind, size: 0, mtimeMs: 0, isLink: f.isLink ?? false })),
+  }) as never)
+  on('fs.stat', (_$, e) => {
+    const file = known[e.path]
+    if (file === undefined || file.dangling) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
+    return { value: { kind: file.kind, size: 0, mtimeMs: 0, isLink: file.isLink ?? false, realPath: file.realPath ?? e.path } }
+  })
   on('process.run', (_$, e) => {
     const args = e.argv.slice(1).filter(a => a !== '--literal-pathspecs')
     if (args[0] === 'rev-parse') return { value: { exitCode: 0, stdout: '/repo\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -334,4 +351,82 @@ test('a refused command registration skips nothing else at the start of the sess
   await $.session.start({ cwd: '/repo' } as never)
   expect(agents).toEqual(['braun'])
   expect(toasts.some(t => t.startsWith('pauli-braun: registering /pauli and /pb-off failed'))).toBe(true)
+})
+
+/** A Braun run in the thread, through the hand-off: the session is in Braun mode with a run recorded. */
+async function braunRuns($: Engine, on: On, clock: { advance: (ms: number) => Promise<unknown> }) {
+  on('tool.call', () => ({ result: 'ok' }))
+  await command($, 'output-style', 'pauli-braun:pauli')
+  await command($, 'handoff')
+  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
+  await clock.advance(1)
+}
+
+const LINKS = {
+  '/repo/link': { kind: 'dir', realPath: '/elsewhere', isLink: true },
+  '/elsewhere': { kind: 'dir' },
+  '/repo/scr': { kind: 'dir', realPath: '/tmp/s', isLink: true },
+  '/tmp/s': { kind: 'dir' },
+} as const
+
+test('Braun\'s writes are checked where they land: through a link out of the project is refused', async ($, on) => {
+  const { clock } = world(on, [], LINKS)
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/link/x', content: 'x' } as never))).toContain('outside the project')
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'cp a /repo/link' } as never))).toContain('outside the project')
+  // Through a link into scratch, it is free.
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/scr/x', content: 'x' } as never))).toBeUndefined()
+})
+
+test('Braun removes a link itself, not what it leads to', async ($, on) => {
+  const { clock } = world(on, [], LINKS)
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'rm /repo/link' } as never))).toBeUndefined()
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'rm /repo/link/x' } as never))).toContain('outside the project')
+})
+
+test('Braun\'s write to a path that lands nowhere is refused, even when it is spelled in scratch', async ($, on) => {
+  const { clock } = world(on, [], { '/tmp/dl': { kind: 'file', isLink: true, dangling: true } })
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/nowhere/x/y', content: 'x' } as never))).toContain('cannot be determined')
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/tmp/dl/y', content: 'x' } as never))).toContain('cannot be determined')
+  // A scratch path that resolves is free.
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/tmp/nowhere/y', content: 'x' } as never))).toBeUndefined()
+})
+
+test('Braun\'s write through a scratch link that leads out is refused', async ($, on) => {
+  const { clock } = world(on, [], { '/tmp/l': { kind: 'file', realPath: '/home/u/.bashrc', isLink: true }, '/home/u/.bashrc': { kind: 'file' } })
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/tmp/l', content: 'x' } as never))).toContain('outside the project')
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'echo x > /tmp/l' } as never))).toContain('outside the project')
+})
+
+const DANGLING = { '/repo/dl': { kind: 'file', isLink: true, dangling: true } } as const
+
+test('Braun\'s write to a dangling link is refused', async ($, on) => {
+  const { clock } = world(on, [], DANGLING)
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/dl', content: 'x' } as never))).toContain('cannot be determined')
+})
+
+test('Braun removes a dangling link', async ($, on) => {
+  const { clock } = world(on, [], DANGLING)
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'rm /repo/dl' } as never))).toBeUndefined()
+})
+
+test('Braun\'s write through an in-project link into scratch is allowed', async ($, on) => {
+  const { clock } = world(on, [], LINKS)
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/scr/x', content: 'x' } as never))).toBeUndefined()
+})
+
+test('a hand-off whose hook fails is refused with the reason', async ($, on) => {
+  // The session's agent list comes back broken (null), as the hand-off hook of a subagent reads it.
+  world(on, { map: () => null } as never)
+  on('tool.call', () => ({ result: 'ok' }))
+  await command($, 'output-style', 'pauli-braun:pauli')
+  const refused = await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'pauli', agentId: 'a1' } as never)
+  expect(denied(refused)).toContain('the hand-off failed')
+  expect(denied(refused)).toContain('/handoff')
 })

@@ -107,6 +107,8 @@ listing branches/tags/stashes, `config --get`…). Refused:
   `perl -i`;
 - package installs and removals (`npm install`, `uv add`, `pip install`, `cargo add`, `apt`…).
 
+This covers the built-in tools: MCP tools are not guarded (see Known limits), so Pauli may call them.
+
 **Starting Braun.** `/handoff` and `/delegate` (or their skills typed by full name, `/pauli-braun:handoff`,
 `/pauli-braun:delegate`) unlock the matching tool for the turn they start, from Pauli mode only; the tool refuses
 otherwise.
@@ -166,6 +168,8 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
 
 - The shell check is a best-effort parser, not a sandbox: the guards stop mistakes, not a determined agent. The
   roles' own instructions do the rest.
+- The guards cover the built-in tools only. MCP tools pass in both modes: they act outside the working tree, and the
+  engine cannot tell beforehand whether a call only reads.
 - Output-style text is read when the plugin loads; after editing `output-styles/*.md`, restart Claude Code.
 - Braun's paths:
   - **Relative paths** resolve from the session's directory. A literal `cd DIR` earlier on the same command line
@@ -173,7 +177,10 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
     can't follow (`cd "$X"`, `cd -`) is refused.
   - **Variables and patterns:** a path holding a variable, a substitution or a glob (`$OUT`, `*.log`) is refused,
     unless its literal folder is already a scratch one. Only `~`, `$HOME` and `$TMPDIR` are expanded.
-  - **Symlinks aren't resolved:** a link inside the project that points outside counts as inside.
+  - **Symlinks:** a path is checked where it lands: links are followed, so a write through a link that leads out
+    of the project is refused, and a link in a scratch folder is judged by where it leads, not by where it is spelled.
+    A removal checks the link itself, not what it leads to. A path that leads nowhere resolvable is refused, and so
+    is a dangling link, whose landing can't be determined.
   - **Unchecked targets:** `patch` and `git apply` (to the working tree) are allowed, with their targets unchecked.
     So are `xargs` and `find -exec` with writers other than removals. Files copied into a folder are checked by
     name, but the contents of a tree (`cp -r`, `rsync dir/`) aren't checked file by file.

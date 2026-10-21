@@ -34,6 +34,18 @@ export type Armed = {
 }
 
 declare module 'claude-code' {
+  /** The inputs of the plugin's own tools; the model's values are still untrusted, so the hooks check them. */
+  interface McpToolInputs {
+    'mcp__pauli-braun__handoff': {
+      to: 'pauli' | 'braun'
+      commit?: { paths: string[]; message: string }
+      allow?: { paths?: string[]; commands?: string[] }
+    }
+    'mcp__pauli-braun__delegate': {
+      allow?: { paths?: string[]; commands?: string[] }
+    }
+  }
+
   interface PluginState {
     'pauli-braun': {
       /** The mode the active output style puts the session in. */

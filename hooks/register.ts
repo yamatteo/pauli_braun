@@ -1,4 +1,4 @@
-import type { EngineInterface, Register } from 'claude-code'
+import { update, type EngineInterface, type Register } from 'claude-code'
 
 import type { Allow, Armed, Delegation, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
@@ -128,7 +128,8 @@ function readAllow(allow: unknown): Allow | { problem: string } {
 async function measureRun($: EngineInterface, allow: Allow): Promise<Run | { problem: string }> {
   const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
   if (top.exitCode !== 0) return { problem: 'this folder is not in a git repository, so nothing Braun changes could be restored' }
-  const root = top.stdout.trim()
+  const root = (await $.fs.stat(top.stdout.trim(), { resolve: true }).catch(() => undefined))?.realPath
+  if (root === undefined) return { problem: `the repository's root (${top.stdout.trim()}) cannot be resolved` }
   const untracked = await $.process.run(['git', 'ls-files', '-z', '--others', '--exclude-standard'], { cwd: root })
   if (untracked.exitCode !== 0) return { problem: `git ls-files failed: ${untracked.stderr.trim()}` }
   return { root, allow, untrackedAtStart: untracked.stdout.split('\0').filter(Boolean) }
@@ -145,10 +146,44 @@ const NOTHING_KNOWN: PathFacts = {
   untrackedAtStart: false, directory: false, holdsIgnored: false,
 }
 
+/**
+ * Where a path lands, symbolic links followed: a write's whole path (a file not there yet is placed by its nearest
+ * existing ancestor), a removal's parent folder plus its last name (`rm link` removes the link, not its target).
+ * Undefined when nothing resolves.
+ */
+async function landing($: EngineInterface, path: string, op: Operation): Promise<string | undefined> {
+  if (path === '/') return '/'
+  const cut = (p: string) => p.lastIndexOf('/')
+  let head = path
+  const tail: string[] = []
+  if (op === 'remove') {
+    tail.push(head.slice(cut(head) + 1))
+    head = cut(head) <= 0 ? '/' : head.slice(0, cut(head))
+  }
+  for (;;) {
+    const stat = await $.fs.stat(head, { resolve: true }).catch(() => undefined)
+    // It exists but leads nowhere (a dangling link): what a write would create is unknown.
+    if (stat !== undefined) return stat.realPath === undefined ? undefined : [stat.realPath.replace(/\/+$/, ''), ...tail].join('/') || '/'
+    if (head === '/') return undefined
+    // A link that stat cannot follow is a dangling one, not a file that is not there yet: a write would create its target.
+    const parent = cut(head) <= 0 ? '/' : head.slice(0, cut(head))
+    const entries = await $.fs.list(parent).catch(() => [])
+    if (entries.some(entry => entry.name === head.slice(cut(head) + 1) && entry.isLink)) return undefined
+    tail.unshift(head.slice(cut(head) + 1))
+    head = cut(head) <= 0 ? '/' : head.slice(0, cut(head))
+  }
+}
+
 /** Why Braun may not write or remove these paths, with what git knows about each; undefined when all may go. */
 async function braunRefusal($: EngineInterface, run: Run, targets: readonly Target[], tmpdir: string | undefined): Promise<string | undefined> {
-  const kind = async (path: string) => (await $.fs.stat(path).catch(() => undefined))?.kind
-  const free = (path: string) => inScratch(path, { tmpdir }) || allowedPath(path, run.allow.paths, run.root)
+  const stat = (path: string) => $.fs.stat(path).catch(() => undefined)
+  const kind = async (path: string) => (await stat(path))?.kind
+  // Scratch is judged where a path lands, against where the scratch folder lands: a link spelled in scratch can lead out.
+  const scratch = tmpdir === undefined ? undefined : (await landing($, tmpdir, 'write')) ?? tmpdir
+  // Brief globs are written by the user against spellings, and may match the landing too.
+  const freeAt = (path: string, real: string | undefined) =>
+    (real !== undefined && inScratch(real, { tmpdir: scratch })) ||
+    allowedPath(path, run.allow.paths, run.root) || (real !== undefined && allowedPath(real, run.allow.paths, run.root))
 
   // A cp, mv, ln, install or rsync into a directory writes the sources' names inside it.
   const checks: { path: string; op: Operation }[] = []
@@ -160,22 +195,24 @@ async function braunRefusal($: EngineInterface, run: Run, targets: readonly Targ
     for (const source of target.sources) {
       const name = source.replace(/\/+$/, '').slice(source.replace(/\/+$/, '').lastIndexOf('/') + 1)
       if (['', '.', '..'].includes(name) || /[$`*?[]/.test(name)) {
-        if (free(target.path)) continue
+        if (freeAt(target.path, await landing($, target.path, 'write'))) continue
         return `writing into ${target.path} (what lands there from ${source} cannot be checked)`
       }
       checks.push({ path: `${target.path}/${name}`, op: 'write' })
     }
   }
 
-  // The first rows of the decision need no git.
-  const inside: { path: string; op: Operation; rel: string }[] = []
+  // The first rows of the decision need no git. Every path is checked where it lands.
+  const inside: { path: string; op: Operation; rel: string; real: string }[] = []
   for (const { path, op } of checks) {
-    const facts = { ...NOTHING_KNOWN, scratch: inScratch(path, { tmpdir }), allowed: allowedPath(path, run.allow.paths, run.root),
-      inGit: touchesGitDir(path), outside: path !== run.root && !path.startsWith(`${run.root}/`) }
-    if (facts.scratch || facts.allowed || facts.inGit || facts.outside) {
-      const why = decide(path, op, facts)
+    const real = await landing($, path, op)
+    if (real === undefined) return `${op === 'write' ? 'writing' : 'removing'} ${path} (where it lands cannot be determined)`
+    if (freeAt(path, real)) continue
+    const facts = { ...NOTHING_KNOWN, inGit: touchesGitDir(real), outside: real !== run.root && !real.startsWith(`${run.root}/`) }
+    if (facts.inGit || facts.outside) {
+      const why = decide(real, op, facts)
       if (why !== undefined) return why
-    } else inside.push({ path, op, rel: path === run.root ? '.' : path.slice(run.root.length + 1) })
+    } else inside.push({ path, op, real, rel: real === run.root ? '.' : real.slice(run.root.length + 1) })
   }
   if (inside.length === 0) return undefined
 
@@ -195,12 +232,14 @@ async function braunRefusal($: EngineInterface, run: Run, targets: readonly Targ
   const dirty = removed.length === 0 ? [] :
     statusPaths(await git(['--literal-pathspecs', 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--', ...removed]))
 
-  for (const { path, op, rel } of inside) {
+  for (const { real, op, rel } of inside) {
     const under = (p: string) => rel === '.' || p === rel || p.startsWith(`${rel}/`)
-    const directory = op === 'remove' && (await kind(path)) === 'dir'
+    // A removed link goes alone, whatever it leads to.
+    const own = op === 'remove' ? await stat(real) : undefined
+    const directory = own?.kind === 'dir' && !own.isLink
     const holdsIgnored = directory &&
       split(await git(['--literal-pathspecs', 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory', '--', rel])).length > 0
-    const why = decide(path, op, {
+    const why = decide(real, op, {
       ...NOTHING_KNOWN,
       ignored: ignored.has(rel),
       tracked: directory ? tracked.some(under) : tracked.includes(rel),
@@ -424,8 +463,7 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     await $.state.set(HANDED_OFF, false)
-    const { value: armed } = await $.state.get(ARMED)
-    if (armed !== undefined && armed !== null && !armed.started) await $.state.set(ARMED, { ...armed, started: true })
+    await update($, ARMED, armed => (armed !== undefined && armed !== null && !armed.started ? { ...armed, started: true } : armed ?? null))
     return next(e)
   })
 
@@ -438,29 +476,18 @@ export const register: Register = (on, options) => {
       const { value: delegation } = await $.state.get(DELEGATION)
       if (delegation !== undefined && delegation !== null && delegation.agentId === null) await $.state.set(DELEGATION, null)
     } else {
-      const { value: delegation } = await $.state.get(DELEGATION)
-      if (delegation?.agentId === e.agentId) await $.state.set(DELEGATION, null)
+      await update($, DELEGATION, delegation => (delegation?.agentId === e.agentId ? null : delegation ?? null))
     }
     return next(e)
   })
 
   // The skills /handoff and /delegate unlock their tools, typed by either name; the skill itself then runs.
-  on('command.run', { command: 'handoff' }, async ($, e, next) => {
+  on('command.run', { command: ['handoff', 'pauli-braun:handoff'] }, async ($, e, next) => {
     await arm($, 'handoff')
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: 'pauli-braun:handoff' }, async ($, e, next) => {
-    await arm($, 'handoff')
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
-  on('command.run', { command: 'delegate' }, async ($, e, next) => {
-    await arm($, 'delegate')
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
-  on('command.run', { command: 'pauli-braun:delegate' }, async ($, e, next) => {
+  on('command.run', { command: ['delegate', 'pauli-braun:delegate'] }, async ($, e, next) => {
     await arm($, 'delegate')
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -486,7 +513,7 @@ export const register: Register = (on, options) => {
   )
 
   on('tool.call', { tool: HANDOFF_TOOL }, async ($, e) => {
-    const { to, commit, allow } = e as unknown as { to?: unknown; commit?: unknown; allow?: unknown }
+    const { to, commit, allow } = e
     if (to !== 'pauli' && to !== 'braun') return { deny: 'pauli-braun: "to" must be "pauli" or "braun".' }
     if (allow !== undefined && to !== 'braun') return { deny: 'pauli-braun: only a hand-off to Braun takes "allow".' }
     if (e.agentId !== undefined) return delegatedHandBack($, e.agentId, to, commit)
@@ -531,11 +558,13 @@ export const register: Register = (on, options) => {
       result: `Hand-off to ${NAME[to]} scheduled: the output style switches to ${STYLE[to]} when this turn ends, ` +
         `and ${NAME[to]} starts on its own.${prepared}${allowed} End your turn now, with no further tool calls.`,
     }
-  })
+  }).catch(($, e, next) => ({
+    deny: `pauli-braun: the hand-off failed (${next.error?.message ?? 'no reason given'}); ask the user to run /handoff again.`,
+  }))
 
   // /delegate opens a delegation, under a run of its own; Pauli's next call, the Agent tool, runs the subagent.
   on('tool.call', { tool: DELEGATE_TOOL }, async ($, e) => {
-    const { allow } = e as unknown as { allow?: unknown }
+    const { allow } = e
     if (e.agentId !== undefined || (await currentMode($)) !== 'pauli')
       return { deny: 'pauli-braun: only Pauli, in the main thread, delegates.' }
     if (!(await isArmed($, 'delegate'))) return { deny: `pauli-braun: no delegation. ${START.delegate}` }
@@ -554,7 +583,9 @@ export const register: Register = (on, options) => {
         'review Braun\'s report when it arrives as its hand-back message.' +
         allowances(run.allow, 'Allowed beyond the defaults for this delegation'),
     }
-  })
+  }).catch(($, e, next) => ({
+    deny: `pauli-braun: the delegation failed (${next.error?.message ?? 'no reason given'}); ask the user to run /delegate again.`,
+  }))
 
   // Short commands. Each schedules its slash command for when the session is idle, never awaiting it here.
   on('command.run', { command: 'pauli' }, async $ => {
