@@ -15,10 +15,13 @@ stays out of the thread.
 ## Install
 
 ```
-/plugin install pauli-braun --marketplace yamatteo/pauli_braun
+/plugin marketplace add yamatteo/noodle_code_foundry
+/plugin install pauli-braun@noodle-code-foundry
 ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope makes it available in every project).
+Pick a scope when asked (user scope makes it available in every project).
+
+This repository no longer serves as a marketplace. If you installed `pauli-braun@pauli-braun`, uninstall it, remove the `pauli-braun` marketplace, and install from noodle-code-foundry as above.
 
 ## The cycle
 
@@ -62,25 +65,25 @@ The delegated Braun's model and effort, by default the session's:
 | `braunModel` | `inherit`, `haiku`, `sonnet`, `opus` | `inherit` (the session's model) |
 | `braunEffort` | `inherit`, `low`, `medium`, `high`, `xhigh`, `max` | `inherit` (the session's effort) |
 
-In a session, run `/plugin configure pauli-braun@pauli-braun` (or `/plugin`, Installed tab, the plugin, **Configure options**). `pauli-braun@pauli-braun` is the plugin ID when the marketplace is added as above;
+In a session, run `/plugin configure pauli-braun@noodle-code-foundry` (or `/plugin`, Installed tab, the plugin, **Configure options**). `pauli-braun@noodle-code-foundry` is the plugin ID when the marketplace is added as above;
 if you added it under another name, use the ID `claude plugin list` shows.
 
-From the shell, `claude plugin configure pauli-braun@pauli-braun` lists the options and whether each is set, and `--values-stdin` saves values (it needs the full ID):
+From the shell, `claude plugin configure pauli-braun@noodle-code-foundry` lists the options and whether each is set, and `--values-stdin` saves values (it needs the full ID):
 
 ```sh
-echo '{"braunModel":"sonnet","braunEffort":"high"}' | claude plugin configure pauli-braun@pauli-braun --values-stdin
+echo '{"braunModel":"sonnet","braunEffort":"high"}' | claude plugin configure pauli-braun@noodle-code-foundry --values-stdin
 ```
 
 At install time, pass `--config` once per option:
 
 ```sh
-claude plugin install pauli-braun@pauli-braun --config braunModel=sonnet --config braunEffort=high
+claude plugin install pauli-braun@noodle-code-foundry --config braunModel=sonnet --config braunEffort=high
 ```
 
 Or edit `~/.claude/settings.json` by hand:
 
 ```json
-{ "pluginConfigs": { "pauli-braun@pauli-braun": { "options": { "braunModel": "sonnet", "braunEffort": "high" } } } }
+{ "pluginConfigs": { "pauli-braun@noodle-code-foundry": { "options": { "braunModel": "sonnet", "braunEffort": "high" } } } }
 ```
 
 Restart Claude Code to apply a change. Project (`.claude/settings.json`) and local settings are ignored for plugin options: a cloned repository must not be able to supply them.
@@ -189,11 +192,10 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
 
 ## Developing
 
-Install from a local clone, so the plugin is read straight from the folder:
+Load the plugin straight from a local clone:
 
 ```
-claude plugin marketplace add ~/pauli_braun
-claude plugin install pauli-braun@pauli-braun
+claude --plugin-dir ~/pauli_braun
 ```
 
 Edits apply after `/reload-plugins` (style text after a restart). Check and test with:
