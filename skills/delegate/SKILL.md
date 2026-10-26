@@ -25,7 +25,7 @@ it can be longer and more detailed than a hand-off brief. Use this form:
 - **Steps**: concrete; name the files, functions and tests involved.
 - **Must not change**: the files, behaviour or interfaces to leave alone.
 - **Baseline**: the test or check commands Braun runs before and after.
-- **Done when**: checkable conditions: tests that pass, a command's output, a reproducible behaviour.
+- **Done when**: checkable conditions: tests that pass, a command's output, a reproducible behaviour. Every done-when and baseline command must finish in under 2 minutes: if the project's suite is slower, name the specific tests or split them; the full slow suite stays with the user.
 - **Allowed beyond the defaults**: "none", or each path glob and command prefix Braun needs past its defaults, with
   why. By default Braun changes only what git can restore (tracked files, new files in the project) and the scratch
   folders (`/tmp`, `$TMPDIR`), installs only into the project, and never uses `sudo`. Name here, explicitly, any

@@ -152,6 +152,9 @@ Installs into the project are allowed (`npm`/`pnpm`/`yarn`/`bun` without `-g`, `
 - system package managers: `apt`, `dnf`, `yum`, `pacman`, `brew`, `snap`, `conda`/`mamba`;
 - any `sudo` or `doas`.
 
+Braun runs commands in the foreground, within 2 minutes (the Bash tool's default timeout). The guard refuses `Monitor`,
+Bash with `run_in_background`, and a `timeout` over 120000 ms; a command that doesn't finish makes the run blocked.
+
 Also refused, whatever the brief says:
 
 - git commands that change the repository: `commit`, `add`, `push`, `pull`, `reset`, `checkout`, `switch`,

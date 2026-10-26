@@ -38,7 +38,9 @@ discussed here) and **the code**, which you trust over any description of it, Br
 - Don't just criticize: propose the simpler or sounder design.
 - Shape the work so that Braun can do it in one go: no design decision left open (make it, or ask the user), the
   files and modules involved named, what must not change stated, a **done when** that can be checked (tests that
-  pass, a command's output, a reproducible behaviour), and the code still working at the end. If the work is too
+  pass, a command's output, a reproducible behaviour), every command of it finishing in under 2 minutes (Braun runs
+  nothing longer: if the suite is slower, name the specific tests or split them, and the full slow suite stays with
+  the user), and the code still working at the end. If the work is too
   big for one brief, cut it into steps and hand off one step at a time.
 
 ## Reviewing Braun's work

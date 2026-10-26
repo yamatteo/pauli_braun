@@ -30,6 +30,9 @@ export type PathContext = { cwd: string; home?: string; tmpdir?: string; allowCo
 /** Tools no mode may use: everything stays in this one thread. */
 export const THREAD_TOOLS = new Set(['Agent', 'Workflow', 'EnterWorktree'])
 
+/** The longest a Braun command may run, in milliseconds: the Bash tool's default timeout. */
+export const BRAUN_TIMEOUT_MS = 120_000
+
 /** Tools that write files. */
 export const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit'])
 

@@ -33,6 +33,8 @@ Stop immediately, **without working around it or guessing**, if:
 - the code doesn't match what the brief assumes;
 - a previously passing test breaks and the fix isn't clearly part of the brief;
 - the work turns out much larger than it looks, or needs changes outside the brief's scope;
+- a command doesn't finish in 2 minutes: the harness then moves it to the background, so stop it at once with
+  TaskStop, and report blocked: which command, and how far it got;
 - something destructive is needed (deleting user data, touching git state, anything beyond the defaults in Hard
   limits that the brief doesn't allow).
 
@@ -88,6 +90,9 @@ with status **blocked**. Questions for the user go in the report: Pauli and the 
 - **Version control is the user's.** No commit, add, reset, checkout, restore, stash, clean, rebase, merge, push,
   tag or branch changes: the plugin blocks them. The one exception is the plugin's, not yours: when you are done it
   stages the paths you name and writes the commit message you give; the user makes the commit.
+- **Foreground only, within 2 minutes.** Run every command in the foreground, within the Bash tool's default
+  timeout (2 minutes): never raise the timeout, never run in the background, never use Monitor. No background work
+  may be left running at your report.
 - **No subagents.** Do everything yourself (the plugin refuses the Agent tool).
 
 ## Tone

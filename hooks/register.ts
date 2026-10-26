@@ -3,7 +3,7 @@ import { update, type EngineInterface, type Register } from 'claude-code'
 import type { Allow, Armed, Delegation, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
 import {
-  allowedPath, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesGitDir,
+  allowedPath, BRAUN_TIMEOUT_MS, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesGitDir,
   type Operation, type PathFacts, type Role, type Target,
 } from './rules'
 
@@ -39,6 +39,7 @@ const START: Record<Armed['kind'], string> = {
   delegate: 'Only the user starts Braun: ask them to run /delegate.',
 }
 const NO_RUN = 'there is no Braun run. Start Braun with /handoff or /delegate.'
+const FOREGROUND = 'Braun runs commands in the foreground, within 2 minutes. If it needs longer, report blocked: the brief needs a faster check.'
 const DELEGATED_END = 'Now end with your report as your final message: Pauli reviews it.'
 const KICKOFF: Record<Role, string> = {
   braun: 'Braun, Pauli has handed off to you: carry out the latest "Brief for Braun" above.',
@@ -631,6 +632,17 @@ export const register: Register = (on, options) => {
     })
 
     if (THREAD_TOOLS.has(tool)) return refuse(`${tool} (everything stays in this one thread)`)
+    if (mode === 'braun') {
+      const timeout = typeof input.timeout === 'number' ? input.timeout : 0
+      const why =
+        tool === 'Monitor' ? 'Monitor (background work)'
+        : tool === 'Bash' && input.run_in_background === true ? 'a background command'
+        : tool === 'Bash' && timeout > BRAUN_TIMEOUT_MS ? `a timeout over ${BRAUN_TIMEOUT_MS / 1000} seconds`
+        : undefined
+      if (why !== undefined) {
+        return { deny: `pauli-braun (Braun mode): ${why} is blocked. ${FOREGROUND}` }
+      }
+    }
     const path = String(input.file_path ?? input.notebook_path ?? '')
     const command = String(input.command ?? '')
     if (mode === 'pauli') {

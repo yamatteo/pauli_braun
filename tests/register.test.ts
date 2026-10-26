@@ -430,3 +430,44 @@ test('a hand-off whose hook fails is refused with the reason', async ($, on) => 
   expect(denied(refused)).toContain('the hand-off failed')
   expect(denied(refused)).toContain('/handoff')
 })
+
+const FOREGROUND_CALLS = [
+  { tool: 'Monitor', command: 'until false; do sleep 1; done' },
+  { tool: 'Bash', command: 'bun test', run_in_background: true },
+  { tool: 'Bash', command: 'bun test', timeout: 120001 },
+] as const
+const FOREGROUND_OK = [
+  { tool: 'Bash', command: 'bun test' },
+  { tool: 'Bash', command: 'bun test', timeout: 120000 },
+  { tool: 'Bash', command: 'bun test', run_in_background: false },
+] as const
+
+test('the in-thread Braun runs in the foreground, within 2 minutes', async ($, on) => {
+  const { clock } = world(on)
+  await braunRuns($, on, clock)
+  for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never))).toContain('foreground')
+  for (const call of FOREGROUND_OK) expect(denied(await $.tool.call(call as never))).toBeUndefined()
+})
+
+test('the delegated Braun runs in the foreground, within 2 minutes', async ($, on) => {
+  world(on)
+  await delegateInBackground($, on)
+  for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call({ ...call, agentId: 'a1' } as never))).toContain('foreground')
+  for (const call of FOREGROUND_OK) expect(denied(await $.tool.call({ ...call, agentId: 'a1' } as never))).toBeUndefined()
+})
+
+test('Braun mode without a run is held to the foreground too', async ($, on) => {
+  world(on)
+  on('tool.call', () => ({ result: 'ok' }))
+  await command($, 'output-style', 'pauli-braun:braun')
+  for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never))).toContain('foreground')
+})
+
+test('the foreground rule is Braun\'s: Pauli and mode off are not held to it', async ($, on) => {
+  world(on)
+  on('tool.call', () => ({ result: 'ok' }))
+  await command($, 'output-style', 'pauli-braun:pauli')
+  for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never) ) ?? '').not.toContain('foreground')
+  await command($, 'output-style', 'default')
+  for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never))).toBeUndefined()
+})
