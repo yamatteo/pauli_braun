@@ -132,16 +132,18 @@ Within a run, Braun may change what can be recovered. The plugin checks each pat
 (file edits; redirections, `tee`, `sed -i`, `perl -i`, `cp`, `mv`, `install`, `ln`, `mkdir`, `touch`, `chmod`,
 `chown`, `truncate`, `dd of=`, `rsync`, `rm`, `rmdir`, `unlink`, `shred`), in this order:
 
-1. under `/tmp`, `/private/tmp` or `$TMPDIR` (the session scratchpad lives there): allowed;
-2. matched by a glob the brief allows: allowed;
-3. inside `.git`: refused;
-4. outside the project: refused;
-5. gitignored: refused;
-6. tracked: writing is allowed, even over your uncommitted changes (Braun leaves such files out of its commit);
+1. inside `<project>/.claude`, or removing a folder that holds it (`rm -r .`): refused, whatever the brief says and
+   even from scratch, because only the user changes the guardians (`.claude-plugin/` is not `.claude/`);
+2. under `/tmp`, `/private/tmp` or `$TMPDIR` (the session scratchpad lives there): allowed;
+3. matched by a glob the brief allows: allowed;
+4. inside `.git`: refused;
+5. outside the project: refused;
+6. gitignored: refused;
+7. tracked: writing is allowed, even over your uncommitted changes (Braun leaves such files out of its commit);
    removing or moving it is allowed only when it has no uncommitted changes (for a folder: no dirty tracked file,
    and nothing ignored or untracked-before-the-run inside);
-7. untracked and already there when the run started (`.env`, notes): refused;
-8. new, or created during the run: allowed (a folder holding gitignored files can't be removed).
+8. untracked and already there when the run started (`.env`, notes): refused;
+9. new, or created during the run: allowed (a folder holding gitignored files can't be removed).
 
 Installs into the project are allowed (`npm`/`pnpm`/`yarn`/`bun` without `-g`, `uv add`/`sync`, `uv pip`,
 `poetry add`, a venv's `pip`). Refused unless the brief allows the command's prefix:
@@ -167,6 +169,38 @@ Also refused, whatever the brief says:
 Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` and wrappers like `sudo`, `env` or
 `timeout` are checked too.
 
+## Guardians
+
+Guardians are durable, user-written checks that run when Braun hands back with a prepared commit. They exist because
+in a long session Pauli forgets principles you stated and accepts commits that break them. Each guard looks at one
+narrow thing. They are advisory only: they never block the hand-off or the commit, Pauli and you decide.
+
+A guard is a file `<repo root>/.claude/guards/<name>.md` (one level, read from the working tree):
+
+```
+---
+paths: ["src/**/*.py", "lib/*.ts"]
+---
+Free text: what the guard checks.
+```
+
+- `paths` is required: globs relative to the repo root, as a flow list or a block list (`- a` lines). Other
+  frontmatter keys are ignored. A file with no frontmatter, or with a missing or empty `paths`, is reported as
+  `invalid` rather than skipped.
+- **When**: only on Braun's hand-back with a `commit` the plugin accepted, in-thread or delegated. With no
+  `.claude/guards/*.md` nothing happens; if no guard matches the committed paths, the report says so in one line.
+- **What a guard sees**: of the committed paths, those its globs match: their staged diff and staged contents
+  (deleted files are named as deleted), cut at 100,000 characters per guard. Past the cap the review is marked
+  `partial` for the model and in the report.
+- **How**: each matching guard is a tool-less Haiku completion (no history, 60 s timeout), run in parallel. It
+  answers `PASS`, `FAIL` or `N/A` on the first line, then reasons. Anything else is `unclear`; a call that did
+  not answer is `did not run`. A failure is never counted as a pass.
+- **Delivery**: a *Guardian report* is appended to the main conversation, where Pauli reads it (in-thread: after the
+  switch to Pauli, before Pauli starts), never through Braun's report. Guard errors only toast.
+- Guards run on Haiku and cost tokens on every such hand-back. Mechanical rules belong in tests and linters; guards
+  are for judgement.
+- Braun may not write or remove anything under `.claude/`.
+
 ## Known limits
 
 - The shell check is a best-effort parser, not a sandbox: the guards stop mistakes, not a determined agent. The
@@ -187,6 +221,8 @@ Commands inside `bash -c`, `eval`, `$(…)`, backticks, `xargs`, `find -exec` an
   - **Unchecked targets:** `patch` and `git apply` (to the working tree) are allowed, with their targets unchecked.
     So are `xargs` and `find -exec` with writers other than removals. Files copied into a folder are checked by
     name, but the contents of a tree (`cp -r`, `rsync dir/`) aren't checked file by file.
+- A guard sees only the matched files' staged diff and contents, and has no tools: it cannot read the rest of the
+  repository or run anything.
 - Every Braun turn ends with a report and a hand-back to Pauli: a turn that ends without one is sent back once to
   write it.
 - A delegated Braun:

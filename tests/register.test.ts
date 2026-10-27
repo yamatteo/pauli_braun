@@ -421,6 +421,16 @@ test('Braun\'s write through an in-project link into scratch is allowed', async 
   expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/scr/x', content: 'x' } as never))).toBeUndefined()
 })
 
+test('Braun may not write or remove inside .claude, whatever the scratch or the brief says', async ($, on) => {
+  const { clock } = world(on, [], { '/': { kind: 'dir' }, '/repo/.claude': { kind: 'dir' }, '/repo/.claude-plugin': { kind: 'dir' } })
+  await braunRuns($, on, clock)
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/.claude/guards/a.md', content: 'x' } as never))).toContain('inside .claude')
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'rm -r /repo/.claude' } as never))).toContain('inside .claude')
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'rm -r /repo' } as never))).toContain('inside .claude')
+  expect(denied(await $.tool.call({ tool: 'Bash', command: 'cp a /repo/.claude' } as never))).toContain('inside .claude')
+  expect(denied(await $.tool.call({ tool: 'Write', file_path: '/repo/.claude-plugin/x', content: 'x' } as never))).toBeUndefined()
+})
+
 test('a hand-off whose hook fails is refused with the reason', async ($, on) => {
   // The session's agent list comes back broken (null), as the hand-off hook of a subagent reads it.
   world(on, { map: () => null } as never)

@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
-  allowedCommand, allowedPath, checkBash, checkEdit, decide, gitChange, globalInstall, inScratch, styleArgMode,
+  allowedCommand, allowedPath, checkBash, checkEdit, decide, gitChange, globalInstall, inScratch, styleArgMode, touchesClaudeDir,
   type PathContext, type PathFacts, type Role, type Target,
 } from '../hooks/rules'
 
@@ -286,4 +286,19 @@ test('the mode /output-style switches to', async () => {
   expect(styleArgMode('Explanatory')).toBe('off')
   expect(styleArgMode('')).toBeUndefined()
   expect(styleArgMode('   ')).toBeUndefined()
+})
+
+test('.claude is Braun\'s no-go, by path segment', async () => {
+  const root = '/home/u/proj'
+  expect(touchesClaudeDir(`${root}/.claude`, 'write', root)).toBe(true)
+  expect(touchesClaudeDir(`${root}/.claude/guards/a.md`, 'write', root)).toBe(true)
+  expect(touchesClaudeDir(`${root}/.claude/guards`, 'remove', root)).toBe(true)
+  expect(touchesClaudeDir(root, 'remove', root)).toBe(true)
+  expect(touchesClaudeDir('/home/u', 'remove', root)).toBe(true)
+  expect(touchesClaudeDir('/', 'remove', root)).toBe(true)
+  expect(touchesClaudeDir(root, 'write', root)).toBe(false)
+  expect(touchesClaudeDir(`${root}/.claude-plugin/plugin.json`, 'write', root)).toBe(false)
+  expect(touchesClaudeDir(`${root}/.claude-plugin`, 'remove', root)).toBe(false)
+  expect(touchesClaudeDir(`${root}/src/.claude/x`, 'write', root)).toBe(false)
+  expect(touchesClaudeDir(`${root}/src/a.ts`, 'remove', root)).toBe(false)
 })

@@ -2,8 +2,9 @@ import { update, type EngineInterface, type Register } from 'claude-code'
 
 import type { Allow, Armed, Delegation, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
+import { runGuards } from './guard'
 import {
-  allowedPath, BRAUN_TIMEOUT_MS, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesGitDir,
+  allowedPath, BRAUN_TIMEOUT_MS, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesClaudeDir, touchesGitDir,
   type Operation, type PathFacts, type Role, type Target,
 } from './rules'
 
@@ -41,6 +42,8 @@ const START: Record<Armed['kind'], string> = {
 const NO_RUN = 'there is no Braun run. Start Braun with /handoff or /delegate.'
 const FOREGROUND = 'Braun runs commands in the foreground, within 2 minutes. If it needs longer, report blocked: the brief needs a faster check.'
 const DELEGATED_END = 'Now end with your report as your final message: Pauli reviews it.'
+const KICKOFF_GUARDED = 'Pauli, Braun has handed back to you: review Braun\'s report and the Guardian report above against the brief and ' +
+  'the actual changes, and give your verdict.'
 const KICKOFF: Record<Role, string> = {
   braun: 'Braun, Pauli has handed off to you: carry out the latest "Brief for Braun" above.',
   pauli: 'Pauli, Braun has handed back to you: review Braun\'s report above against the brief and the actual changes, and give your verdict.',
@@ -175,6 +178,9 @@ async function landing($: EngineInterface, path: string, op: Operation): Promise
   }
 }
 
+const claudeRefusal = (path: string, op: Operation) =>
+  `${op === 'write' ? 'writing' : 'removing'} ${path} (inside .claude, which only the user changes)`
+
 /** Why Braun may not write or remove these paths, with what git knows about each; undefined when all may go. */
 async function braunRefusal($: EngineInterface, run: Run, targets: readonly Target[], tmpdir: string | undefined): Promise<string | undefined> {
   const stat = (path: string) => $.fs.stat(path).catch(() => undefined)
@@ -196,7 +202,9 @@ async function braunRefusal($: EngineInterface, run: Run, targets: readonly Targ
     for (const source of target.sources) {
       const name = source.replace(/\/+$/, '').slice(source.replace(/\/+$/, '').lastIndexOf('/') + 1)
       if (['', '.', '..'].includes(name) || /[$`*?[]/.test(name)) {
-        if (freeAt(target.path, await landing($, target.path, 'write'))) continue
+        const real = await landing($, target.path, 'write')
+        if (real !== undefined && touchesClaudeDir(real, 'write', run.root)) return claudeRefusal(target.path, 'write')
+        if (freeAt(target.path, real)) continue
         return `writing into ${target.path} (what lands there from ${source} cannot be checked)`
       }
       checks.push({ path: `${target.path}/${name}`, op: 'write' })
@@ -208,6 +216,7 @@ async function braunRefusal($: EngineInterface, run: Run, targets: readonly Targ
   for (const { path, op } of checks) {
     const real = await landing($, path, op)
     if (real === undefined) return `${op === 'write' ? 'writing' : 'removing'} ${path} (where it lands cannot be determined)`
+    if (touchesClaudeDir(real, op, run.root)) return claudeRefusal(path, op)
     if (freeAt(path, real)) continue
     const facts = { ...NOTHING_KNOWN, inGit: touchesGitDir(real), outside: real !== run.root && !real.startsWith(`${run.root}/`) }
     if (facts.inGit || facts.outside) {
@@ -260,7 +269,7 @@ const IN_PROGRESS = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-me
  * Stages the paths of Braun's `commit` and writes its message to SQUASH_MSG, for VS Code's commit box: a line for the
  * hand-off's result, or why nothing was staged.
  */
-async function prepareCommit($: EngineInterface, commit: unknown): Promise<{ done: string } | { problem: string }> {
+async function prepareCommit($: EngineInterface, commit: unknown): Promise<{ done: string; root: string; paths: string[] } | { problem: string }> {
   const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
   if (top.exitCode !== 0) return { problem: 'this folder is not in a git repository' }
   const cwd = top.stdout.trim()
@@ -297,7 +306,34 @@ async function prepareCommit($: EngineInterface, commit: unknown): Promise<{ don
   return {
     done: `Commit prepared: staged ${request.paths.length} path(s) and wrote the message to ${squashMsg}.` +
       (others.length > 0 ? ` Also staged, not by this hand-off: ${others.join(', ')}.` : ''),
+    root: cwd,
+    paths: request.paths,
   }
+}
+
+/**
+ * The Guardian report for a prepared commit, or undefined when there are no guards. Advisory: whatever goes wrong
+ * here is toasted at most, and the hand-off and the commit stand.
+ */
+async function guardianReport($: EngineInterface, outcome: { root: string; paths: string[] }): Promise<string | undefined> {
+  try {
+    return await runGuards($, outcome.root, outcome.paths)
+  } catch (err) {
+    $.ui.toast(`pauli-braun: the guardian failed: ${String(err)}`)
+    return undefined
+  }
+}
+
+/** Appends the report to the main conversation, where the model reads it; whether it was stored. */
+async function deliverReport($: EngineInterface, report: string): Promise<boolean> {
+  try {
+    const stored = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: report }] } })
+    if (stored.deny === undefined) return true
+    $.ui.toast(`pauli-braun: the Guardian report was refused: ${stored.deny}`)
+  } catch (err) {
+    $.ui.toast(`pauli-braun: the Guardian report failed: ${String(err)}`)
+  }
+  return false
 }
 
 /** The handoff tool called from a subagent: only the delegated Braun, handing back, and only to prepare its commit. */
@@ -313,6 +349,8 @@ async function delegatedHandBack($: EngineInterface, agentId: string, to: Role, 
       deny: `pauli-braun: no commit prepared: ${outcome.problem}. Correct it and call again, or end without "commit" ` +
         'and say in your report why no commit was prepared.',
     }
+  const report = await guardianReport($, outcome)
+  if (report !== undefined) await deliverReport($, report)
   return { result: `${outcome.done} ${DELEGATED_END}` }
 }
 
@@ -525,6 +563,7 @@ export const register: Register = (on, options) => {
       return { deny: 'pauli-braun: no hand-off: a delegated Braun is still working; wait for its report.' }
 
     let prepared = ''
+    let report: string | undefined
     if (commit !== undefined) {
       if (mode !== 'braun' || to !== 'pauli') return { deny: 'pauli-braun: only Braun, handing back to Pauli, prepares a commit.' }
       const outcome = await prepareCommit($, commit).catch(err => ({ problem: String(err) }))
@@ -534,6 +573,7 @@ export const register: Register = (on, options) => {
             'hand off without "commit" and say in one line why no commit was prepared.',
         }
       prepared = ` ${outcome.done}`
+      report = await guardianReport($, outcome)
     }
 
     // A hand-off to Braun measures its run now (what git can restore, the brief's allowances), but records it only
@@ -553,7 +593,9 @@ export const register: Register = (on, options) => {
     later($, `the hand-off to ${NAME[to]}`, async () => {
       await switchStyle($, STYLE[to])
       if (run !== undefined) await $.state.set(RUN, run)
-      await $.prompt.submit({ text: KICKOFF[to] })
+      // After the switch, so Braun's still-running turn never sees it; before the kickoff, so Pauli does.
+      const appended = report !== undefined && (await deliverReport($, report))
+      await $.prompt.submit({ text: appended ? KICKOFF_GUARDED : KICKOFF[to] })
     })
     return {
       result: `Hand-off to ${NAME[to]} scheduled: the output style switches to ${STYLE[to]} when this turn ends, ` +

@@ -392,6 +392,16 @@ export function allowedPath(path: string, globs: readonly string[], root: string
   return globs.some(glob => globPattern(glob.startsWith('/') ? glob : `${root}/${glob.replace(/^(\.\/)+/, '')}`).test(path))
 }
 
+/**
+ * Whether Braun writing or removing `real` (where a path lands, absolute) touches `<root>/.claude`: the folder, what is
+ * inside it, or, for a removal, a folder holding it (`rm -r .`). Compared by path segment: `.claude-plugin` is not it.
+ */
+export function touchesClaudeDir(real: string, op: Operation, root: string): boolean {
+  const dir = `${root.replace(/\/+$/, '')}/.claude`
+  if (real === dir || real.startsWith(`${dir}/`)) return true
+  return op === 'remove' && (real === '/' || dir.startsWith(`${real.replace(/\/+$/, '')}/`))
+}
+
 // --- Braun: installs ----------------------------------------------------
 
 const READ_ONLY_PACKAGES = new Set(['list', 'search', 'show', 'info', 'policy', 'madison', 'depends', 'rdepends', 'provides', 'help'])
