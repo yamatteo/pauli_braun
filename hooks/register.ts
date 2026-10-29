@@ -4,7 +4,7 @@ import type { Allow, Armed, Delegation, Mode, Run } from '../types'
 import { checkCommit, isOurs, squashMessage, statusPaths } from './commit'
 import { runGuards } from './guard'
 import {
-  allowedPath, BRAUN_TIMEOUT_MS, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, styleArgMode, THREAD_TOOLS, touchesClaudeDir, touchesGitDir,
+  allowedPath, BRAUN_TIMEOUT_MS, checkBash, checkEdit, decide, EDIT_TOOLS, inScratch, resolvePath, THREAD_TOOLS, touchesClaudeDir, touchesGitDir,
   type Operation, type PathFacts, type Role, type Target,
 } from './rules'
 
@@ -22,7 +22,6 @@ const AGENT = 'pauli-braun:braun'
 const MODELS = ['inherit', 'haiku', 'sonnet', 'opus']
 const EFFORTS = ['inherit', 'low', 'medium', 'high', 'xhigh', 'max']
 
-const STYLE: Record<Role, string> = { pauli: 'pauli-braun:pauli', braun: 'pauli-braun:braun' }
 const NAME: Record<Role, string> = { pauli: 'Pauli', braun: 'Braun' }
 const STATUS: Record<Role, string> = {
   pauli: 'Pauli · discuss & review, no edits',
@@ -49,18 +48,10 @@ const KICKOFF: Record<Role, string> = {
   pauli: 'Pauli, Braun has handed back to you: review Braun\'s report above against the brief and the actual changes, and give your verdict.',
 }
 
-function modeOf(style: string | null | undefined): Mode {
-  if (style === STYLE.pauli) return 'pauli'
-  if (style === STYLE.braun) return 'braun'
-  return 'off'
-}
-
-/** The mode the active output style puts the session in. */
+/** The session's mode; every new session starts off. */
 async function currentMode($: EngineInterface): Promise<Mode> {
   const { value } = await $.state.get(MODE)
-  if (value !== undefined) return value
-  const { outputStyle } = await $.settings.read()
-  return modeOf(typeof outputStyle === 'string' ? outputStyle : undefined)
+  return value ?? 'off'
 }
 
 /**
@@ -354,13 +345,6 @@ async function delegatedHandBack($: EngineInterface, agentId: string, to: Role, 
   return { result: `${outcome.done} ${DELEGATED_END}` }
 }
 
-/** Switches the output style, then records the mode itself: the plugin's own /output-style hook doesn't see this run. */
-async function switchStyle($: EngineInterface, style: string): Promise<void> {
-  await $.command.run({ command: 'output-style', args: style })
-  const mode = styleArgMode(style)
-  if (mode !== undefined) await applyMode($, mode)
-}
-
 /** Runs `work` once the session is idle; a command handler or tool call must not await a slash command itself. */
 function later($: EngineInterface, label: string, work: () => Promise<void>): void {
   $.clock.after(0, async () => {
@@ -377,13 +361,16 @@ export const register: Register = (on, options) => {
   const model = pick(options.braunModel, MODELS)
   const effort = pick(options.braunEffort, EFFORTS)
 
+  // The role texts the prompt.compose hook adds, read at session start; a role whose text failed to read adds nothing.
+  const rolePrompt: Partial<Record<Role, string>> = {}
+
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'handoff',
       description:
         'Hands the session over between the pauli-braun roles. Pauli calls it with to="braun" right after writing ' +
         'the "Brief for Braun", and only when the user asked for the hand-off (the handoff skill). Braun calls it ' +
-        'with to="pauli" right after writing its report (the report skill). The output style switches when the ' +
+        'with to="pauli" right after writing its report (the report skill). The mode switches when the ' +
         'current turn ends and the other role starts on its own, so end your turn right after calling it. ' +
         'Braun handing back done work may pass "commit": the plugin stages those paths and writes the message to ' +
         'SQUASH_MSG, where VS Code shows it as the commit message; if that fails, the hand-off is refused with the reason. ' +
@@ -462,9 +449,17 @@ export const register: Register = (on, options) => {
     // Each step on its own, so that one refused can't skip the rest. /handoff and /delegate are the skills' names.
     try {
       await $.command.register({ name: 'pauli', description: 'Switch to Pauli mode: discuss, plan and review, no edits' })
-      await $.command.register({ name: 'pb-off', description: 'Leave Pauli/Braun mode (back to the default output style)' })
+      await $.command.register({ name: 'pb-off', description: 'Leave Pauli/Braun mode' })
     } catch (err) {
       $.ui.toast(`pauli-braun: registering /pauli and /pb-off failed: ${String(err)}`)
+    }
+    for (const [role, file] of [['pauli', 'pauli.md'], ['braun', 'braun-thread.md']] as const) {
+      try {
+        rolePrompt[role] = await $.fs.read(`${$.plugin.root}/prompts/${file}`)
+      } catch (err) {
+        delete rolePrompt[role]
+        $.ui.toast(`pauli-braun: reading prompts/${file} failed, so ${NAME[role]} mode adds no prompt: ${String(err)}`)
+      }
     }
     try {
       const mode = await currentMode($)
@@ -486,19 +481,14 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // The output style is the mode: read it every time the system prompt is composed.
+  // The mode is the session's own: its role text is added to the system prompt, after every shared section.
   on('prompt.compose', async ($, e, next) => {
-    await applyMode($, modeOf(e.outputStyle?.name))
-    return next(e)
+    const r = await next(e)
+    const mode = await currentMode($)
+    const text = mode === 'off' ? undefined : rolePrompt[mode]
+    if (text === undefined) return r
+    return { sections: [...r.sections, { id: 'pauli-braun:mode', text, scope: 'session' }] }
   })
-
-  // And as soon as /output-style runs, so the status line doesn't wait for the next message.
-  on('command.run', { command: 'output-style' }, async ($, e, next) => {
-    const ran = await next(e)
-    const mode = styleArgMode(e.args)
-    if (mode !== undefined) await applyMode($, mode)
-    return ran
-  }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
     await $.state.set(HANDED_OFF, false)
@@ -591,14 +581,14 @@ export const register: Register = (on, options) => {
 
     await $.state.set(HANDED_OFF, true)
     later($, `the hand-off to ${NAME[to]}`, async () => {
-      await switchStyle($, STYLE[to])
+      await applyMode($, to)
       if (run !== undefined) await $.state.set(RUN, run)
       // After the switch, so Braun's still-running turn never sees it; before the kickoff, so Pauli does.
       const appended = report !== undefined && (await deliverReport($, report))
       await $.prompt.submit({ text: appended ? KICKOFF_GUARDED : KICKOFF[to] })
     })
     return {
-      result: `Hand-off to ${NAME[to]} scheduled: the output style switches to ${STYLE[to]} when this turn ends, ` +
+      result: `Hand-off to ${NAME[to]} scheduled: the session switches to ${NAME[to]} mode when this turn ends, ` +
         `and ${NAME[to]} starts on its own.${prepared}${allowed} End your turn now, with no further tool calls.`,
     }
   }).catch(($, e, next) => ({
@@ -632,12 +622,12 @@ export const register: Register = (on, options) => {
 
   // Short commands. Each schedules its slash command for when the session is idle, never awaiting it here.
   on('command.run', { command: 'pauli' }, async $ => {
-    later($, 'switching to Pauli', () => switchStyle($, STYLE.pauli))
+    later($, 'switching to Pauli', () => applyMode($, 'pauli'))
     return { text: 'Switching to Pauli mode.' }
   })
 
   on('command.run', { command: 'pb-off' }, async $ => {
-    later($, 'leaving Pauli/Braun mode', () => switchStyle($, 'default'))
+    later($, 'leaving Pauli/Braun mode', () => applyMode($, 'off'))
     return { text: 'Leaving Pauli/Braun mode.' }
   })
 

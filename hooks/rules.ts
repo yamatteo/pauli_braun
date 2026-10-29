@@ -759,12 +759,3 @@ export function checkEdit(tool: string, path: string, role: Role): string | unde
   if (role === 'pauli') return `${tool} (Pauli does not edit files)`
   return touchesGitDir(path) ? `${tool} on ${path} (inside .git)` : undefined
 }
-
-/** The mode `/output-style <args>` switches to; undefined when it switches nothing (a bare `/output-style` lists). */
-export function styleArgMode(args: string): Role | 'off' | undefined {
-  const style = args.trim().toLowerCase()
-  if (style === '') return undefined
-  if (style === 'pauli-braun:pauli') return 'pauli'
-  if (style === 'pauli-braun:braun') return 'braun'
-  return 'off'
-}

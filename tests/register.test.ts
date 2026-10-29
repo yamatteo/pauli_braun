@@ -13,14 +13,16 @@ function world(
   on: On,
   agents: { id: string; type: string; status?: AgentStatus }[] = [],
   files: Record<string, { kind: 'file' | 'dir'; realPath?: string; isLink?: boolean; dangling?: boolean }> = {},
+  settings: Record<string, unknown> = {},
 ) {
   const prompts: string[] = []
   const toasts: string[] = []
   const clock = mock.clock(on)
+  worldClock = clock
   mock.env(on, { HOME: '/home/u', TMPDIR: '/var/tmp/x' })
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_$, e) => (toasts.push(e.text), { value: undefined }))
-  on('settings.read', () => ({ value: {} }) as never)
+  on('settings.read', () => ({ value: settings }) as never)
   on('session.cwd', () => ({ value: '/repo' }))
   on('command.run', () => ({ text: 'ran' }) as never)
   on('prompt.submit', (_$, e) => (prompts.push(e.text), { text: e.text }) as never)
@@ -50,6 +52,14 @@ function world(
   return { prompts, toasts, clock }
 }
 
+let worldClock: ReturnType<typeof mock.clock>
+
+/** Puts the session in Pauli mode or out of the mode, the way the user does: /pauli or /pb-off, then the session goes idle. */
+async function enter($: Engine, mode: 'pauli' | 'off') {
+  await command($, mode === 'pauli' ? 'pauli' : 'pb-off')
+  await worldClock.advance(1)
+}
+
 /** Runs a slash command the way the user does. */
 const command = ($: Engine, name: string, args = '') =>
   $.command.run({ command: name, args } as never)
@@ -59,7 +69,7 @@ const denied = (result: { deny?: string }) => result.deny
 test('the hand-off to Braun needs /handoff, and only for the turn it starts', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
 
   const unasked = await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never)
   expect(denied(unasked)).toContain('/handoff')
@@ -84,7 +94,7 @@ test('the hand-off to Braun needs /handoff, and only for the turn it starts', as
 test('typing the skill by its full name unlocks the hand-off too', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'pauli-braun:handoff')
   expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
 })
@@ -92,24 +102,21 @@ test('typing the skill by its full name unlocks the hand-off too', async ($, on)
 test('the run is recorded only once the session has switched to Braun', async ($, on) => {
   const { prompts, clock } = world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'handoff')
   expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
 
-  // The switch hasn't happened yet: switching to Braun by hand finds no run.
-  await command($, 'output-style', 'pauli-braun:braun')
-  expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('there is no Braun run')
+  // The switch hasn't happened yet: the session is still Pauli's, which edits nothing.
+  expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('Pauli does not edit')
 
-  // Back in Pauli mode, the scheduled hand-off switches to Braun, records the run and submits the kickoff.
-  await command($, 'output-style', 'pauli-braun:pauli')
+  // The scheduled hand-off switches to Braun, records the run and submits the kickoff.
   await clock.advance(1)
   expect(prompts.some(p => p.startsWith('Braun, Pauli has handed off to you'))).toBe(true)
   expect(denied(await $.tool.call(WRITE_NEW as never))).toBeUndefined()
 
   // Any mode change ends the run.
-  await command($, 'output-style', 'pauli-braun:pauli')
-  await command($, 'output-style', 'pauli-braun:braun')
-  expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('there is no Braun run')
+  await enter($, 'pauli')
+  expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('Pauli does not edit')
 })
 
 const DELEGATE = { tool: 'mcp__pauli-braun__delegate' } as const
@@ -132,7 +139,7 @@ async function delegateInBackground($: Engine, on: On, turnId = 'p1') {
     await $.agent.spawn({ prompt: 'Brief for Braun: add new.txt', subagentType: AGENT, background: true } as never)
     return { result: 'Async agent launched successfully.' }
   })
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'delegate')
   await $.turn.start({ text: 'brief', turnId } as never)
   expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
@@ -143,7 +150,7 @@ async function delegateInBackground($: Engine, on: On, turnId = 'p1') {
 test('delegating needs /delegate and Pauli mode', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   const delegate = () => $.tool.call(DELEGATE as never)
 
   expect(denied(await delegate())).toContain('/delegate')
@@ -156,10 +163,13 @@ test('delegating needs /delegate and Pauli mode', async ($, on) => {
   expect(denied(opened)).toBeUndefined()
   expect(String(opened.result)).toContain(`subagent_type "${AGENT}"`)
 
-  // /delegate only arms from Pauli mode, and the tool only runs there.
-  await command($, 'output-style', 'pauli-braun:braun')
+})
+
+test('/delegate arms only from Pauli mode, and the tool only runs there', async ($, on) => {
+  const { clock } = world(on)
+  await braunRuns($, on, clock)
   await command($, 'delegate')
-  expect(denied(await delegate())).toContain('only Pauli')
+  expect(denied(await $.tool.call(DELEGATE as never))).toContain('only Pauli')
 })
 
 test('a delegated Braun works under Braun\'s rules, and its report comes back to Pauli', async ($, on) => {
@@ -177,7 +187,7 @@ test('a delegated Braun works under Braun\'s rules, and its report comes back to
     seen.handBack = (await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun', agentId: 'a1' } as never)).deny
     return { result: "**Braun's report**\n- Status: done" }
   })
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
 
   // Pauli itself still may not write.
   expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('Pauli mode')
@@ -202,7 +212,7 @@ test('the Agent call for Braun needs an open delegation, and runs once', async (
   world(on)
   let runs = 0
   on('tool.call', async (_$, e) => (e.tool === 'Agent' && (runs += 1), { result: 'report' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
 
   expect(denied(await $.tool.call(BRAUN_CALL as never))).toContain('/delegate')
 
@@ -260,7 +270,7 @@ test('a /handoff to Braun is refused while a delegated Braun is working', async 
 test('an Agent call that spawns no subagent leaves no delegation behind', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'interrupted' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'delegate')
   expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
   expect(denied(await $.tool.call(BRAUN_CALL as never))).toBeUndefined()
@@ -273,7 +283,7 @@ test('an Agent call that spawns no subagent leaves no delegation behind', async 
 test('a delegation the Agent call never claims ends with Pauli\'s turn', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'delegate')
   await $.turn.start({ text: 'brief', turnId: 't1' } as never)
   expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
@@ -321,7 +331,7 @@ test('by default the delegated Braun inherits the session\'s model and effort', 
 test('typing /pauli-braun:delegate unlocks the delegation too', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'pauli-braun:delegate')
   expect(denied(await $.tool.call(DELEGATE as never))).toBeUndefined()
 })
@@ -356,7 +366,7 @@ test('a refused command registration skips nothing else at the start of the sess
 /** A Braun run in the thread, through the hand-off: the session is in Braun mode with a run recorded. */
 async function braunRuns($: Engine, on: On, clock: { advance: (ms: number) => Promise<unknown> }) {
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   await command($, 'handoff')
   expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
   await clock.advance(1)
@@ -435,7 +445,7 @@ test('a hand-off whose hook fails is refused with the reason', async ($, on) => 
   // The session's agent list comes back broken (null), as the hand-off hook of a subagent reads it.
   world(on, { map: () => null } as never)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   const refused = await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'pauli', agentId: 'a1' } as never)
   expect(denied(refused)).toContain('the hand-off failed')
   expect(denied(refused)).toContain('/handoff')
@@ -466,18 +476,74 @@ test('the delegated Braun runs in the foreground, within 2 minutes', async ($, o
   for (const call of FOREGROUND_OK) expect(denied(await $.tool.call({ ...call, agentId: 'a1' } as never))).toBeUndefined()
 })
 
-test('Braun mode without a run is held to the foreground too', async ($, on) => {
-  world(on)
-  on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:braun')
+test('Braun mode is held to the foreground too', async ($, on) => {
+  const { clock } = world(on)
+  await braunRuns($, on, clock)
   for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never))).toContain('foreground')
 })
 
 test('the foreground rule is Braun\'s: Pauli and mode off are not held to it', async ($, on) => {
   world(on)
   on('tool.call', () => ({ result: 'ok' }))
-  await command($, 'output-style', 'pauli-braun:pauli')
+  await enter($, 'pauli')
   for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never) ) ?? '').not.toContain('foreground')
-  await command($, 'output-style', 'default')
+  await enter($, 'off')
   for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never))).toBeUndefined()
+})
+
+/** The system prompt as the engine composes it (one shared section), the role texts readable, the session started. */
+async function composing($: Engine, on: On, settings: Record<string, unknown> = {}, unreadable = '') {
+  const world_ = world(on, [], {}, settings)
+  on('fs.read', (_$, e) => {
+    if (unreadable !== '' && e.path.endsWith(unreadable)) throw new Error('ENOENT')
+    return { value: `text of ${e.path.slice(e.path.lastIndexOf('/') + 1)}` } as never
+  })
+  on('tool.register', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('agent.register', () => ({ value: { agent: AGENT } }) as never)
+  on('session.start', () => ({ cwd: '/repo' }) as never)
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'base', scope: 'shared' }] }))
+  on('tool.call', () => ({ result: 'ok' }))
+  await $.session.start({ cwd: '/repo' } as never)
+  return world_
+}
+
+const compose = async ($: Engine, outputStyle: { name: string; isKeepingCodingInstructions: boolean } | null = null) =>
+  (await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle, traits: [] })).sections
+const modeSection = async ($: Engine) => (await compose($)).filter(s => s.id === 'pauli-braun:mode')
+
+test('a fresh session is off: no mode section, whatever the shared settings say', async ($, on) => {
+  await composing($, on, { outputStyle: 'pauli-braun:pauli' })
+  expect((await compose($)).map(s => s.id)).toEqual(['intro'])
+  // The output style the engine reports is ignored.
+  expect((await compose($, { name: 'pauli-braun:pauli', isKeepingCodingInstructions: true })).map(s => s.id)).toEqual(['intro'])
+  // And the Pauli-only tools stay locked: the mode is off.
+  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toContain('/handoff')
+})
+
+test('in Pauli mode the system prompt ends with the Pauli section', async ($, on) => {
+  await composing($, on)
+  await enter($, 'pauli')
+  const sections = await compose($)
+  expect(sections.map(s => s.id)).toEqual(['intro', 'pauli-braun:mode'])
+  expect(sections.at(-1)).toEqual({ id: 'pauli-braun:mode', text: 'text of pauli.md', scope: 'session' })
+})
+
+test('after a hand-off to Braun the section holds the Braun text, and /pb-off removes it', async ($, on) => {
+  const { clock } = await composing($, on)
+  await enter($, 'pauli')
+  await command($, 'handoff')
+  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
+  await clock.advance(1)
+  expect(await modeSection($)).toEqual([{ id: 'pauli-braun:mode', text: 'text of braun-thread.md', scope: 'session' }])
+
+  await enter($, 'off')
+  expect(await modeSection($)).toEqual([])
+})
+
+test('a role text that cannot be read adds nothing, and says so', async ($, on) => {
+  const { toasts } = await composing($, on, {}, 'pauli.md')
+  expect(toasts.some(t => t.includes('prompts/pauli.md'))).toBe(true)
+  await enter($, 'pauli')
+  expect(await modeSection($)).toEqual([])
 })

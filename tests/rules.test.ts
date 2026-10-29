@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
-  allowedCommand, allowedPath, checkBash, checkEdit, decide, gitChange, globalInstall, inScratch, styleArgMode, touchesClaudeDir,
+  allowedCommand, allowedPath, checkBash, checkEdit, decide, gitChange, globalInstall, inScratch, touchesClaudeDir,
   type PathContext, type PathFacts, type Role, type Target,
 } from '../hooks/rules'
 
@@ -277,15 +277,6 @@ test('edits: Pauli never, Braun outside .git', async () => {
 test('git global options before the subcommand', async () => {
   expect(gitChange(['--no-pager', '-c', 'core.x=y', 'log'], 'braun')).toBeUndefined()
   expect(gitChange(['-C', '/tmp/r', 'commit', '-m', 'x'], 'braun')).toBe('git commit')
-})
-
-test('the mode /output-style switches to', async () => {
-  expect(styleArgMode('pauli-braun:pauli')).toBe('pauli')
-  expect(styleArgMode('Pauli-Braun:BRAUN')).toBe('braun')
-  expect(styleArgMode('default')).toBe('off')
-  expect(styleArgMode('Explanatory')).toBe('off')
-  expect(styleArgMode('')).toBeUndefined()
-  expect(styleArgMode('   ')).toBeUndefined()
 })
 
 test('.claude is Braun\'s no-go, by path segment', async () => {

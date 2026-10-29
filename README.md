@@ -7,7 +7,9 @@ A Claude Code plugin for a two-role workflow inside **one session thread**:
   changes code. It never touches version control itself: when its work is done, the plugin stages it and prepares
   the commit message for you.
 
-Each role is an output style, so the active mode is visible in the status line and in the system prompt. Hooks
+Each role is a section of the system prompt that the plugin adds per session, and the active mode shows on the
+status line. Every new session starts outside Pauli/Braun mode; you start it with `/pauli`. Two sessions in the same
+folder are independent: one can be in Pauli while the other stays in the default style. Hooks
 guard what each role may do, and skills carry the hand-offs. There is no plan file: the conversation is the
 record. When you trust Braun with a piece of work, `/delegate` runs it in a Braun subagent instead, so its effort
 stays out of the thread.
@@ -47,12 +49,18 @@ The plugin prepares nothing, and refuses the hand-off until Braun corrects it, w
 revert is in progress, when a `SQUASH_MSG` it didn't write is there, when a path isn't among git's changes, or when
 the message isn't a Conventional Commits one. Files that were already dirty before Braun started are left unstaged.
 
+## Upgrading from the output-style versions
+
+Older versions made each role an output style and saved `"outputStyle": "pauli-braun:pauli"` (or `:braun`) in
+`.claude/settings.local.json`, which every session in the folder shared. The plugin no longer reads or writes it, and
+no longer ships output styles. Remove that line by hand, or run `/output-style default`.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `/pauli` | Switch to Pauli mode |
-| `/pb-off` | Leave Pauli/Braun mode (back to the default output style) |
+| `/pb-off` | Leave Pauli/Braun mode |
 | `/handoff [notes]` | From Pauli mode: write the brief and hand off to Braun |
 | `/delegate [notes]` | From Pauli mode: write a self-contained brief for a Braun subagent, wait for its report, review it |
 
@@ -207,7 +215,7 @@ Free text: what the guard checks.
   roles' own instructions do the rest.
 - The guards cover the built-in tools only. MCP tools pass in both modes: they act outside the working tree, and the
   engine cannot tell beforehand whether a call only reads.
-- Output-style text is read when the plugin loads; after editing `output-styles/*.md`, restart Claude Code.
+- The role texts `prompts/pauli.md` and `prompts/braun-thread.md` are read at session start; after editing them, run `/reload-plugins`.
 - Braun's paths:
   - **Relative paths** resolve from the session's directory. A literal `cd DIR` earlier on the same command line
     moves the base; a `cd` inside `( … )` still counts after the parentheses. A path after a `cd` the plugin
