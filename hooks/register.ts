@@ -13,6 +13,13 @@ const HANDED_OFF = { plugin: 'pauli-braun', key: 'handedOff' } as const
 const RUN = { plugin: 'pauli-braun', key: 'run' } as const
 const DELEGATION = { plugin: 'pauli-braun', key: 'delegation' } as const
 const ARMED = { plugin: 'pauli-braun', key: 'armed' } as const
+const ROW_AGE = { plugin: 'pauli-braun', key: 'rowAge' } as const
+const NUDGED = { plugin: 'pauli-braun', key: 'nudged' } as const
+
+/** Main-loop turns after which the role row is appended again, against compaction. */
+const REFRESH_TURNS = 10
+const NUDGE = 'You are Braun and this turn is ending without a hand-back. Invoke the pauli-braun:report skill now: ' +
+  'write your report (done or blocked) and hand the session back to Pauli.'
 
 const HANDOFF_TOOL = 'mcp__pauli-braun__handoff'
 const DELEGATE_TOOL = 'mcp__pauli-braun__delegate'
@@ -65,6 +72,7 @@ async function applyMode($: EngineInterface, mode: Mode): Promise<void> {
     $.ui.status(mode === 'off' ? undefined : STATUS[mode])
     await $.state.set(RUN, null)
   }
+  await $.state.set(NUDGED, false)
 }
 
 /** Unlocks the tool that starts Braun, for the turn the user's command starts; only from Pauli mode. */
@@ -327,6 +335,28 @@ async function deliverReport($: EngineInterface, report: string): Promise<boolea
   return false
 }
 
+/**
+ * Appends the role row for the mode: a user row in the main conversation, where the model reads it. Never throws: a
+ * row refused or failed is toasted.
+ */
+async function announceMode($: EngineInterface, mode: Mode, texts: Partial<Record<Role, string>>): Promise<void> {
+  let text: string
+  if (mode === 'off') {
+    text = 'pauli-braun: this session has left Pauli/Braun mode. The earlier Pauli and Braun instructions no longer apply.'
+  } else {
+    const role = texts[mode]
+    text = `pauli-braun: this session is now in ${NAME[mode]} mode. Follow these instructions until a later pauli-braun row changes the mode:\n\n` +
+      (role ?? `(The text of the ${NAME[mode]} instructions could not be read.)`)
+  }
+  try {
+    await $.state.set(ROW_AGE, 0)
+    const stored = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+    if (stored.deny !== undefined) $.ui.toast(`pauli-braun: the ${mode} mode row was refused: ${stored.deny}`)
+  } catch (err) {
+    $.ui.toast(`pauli-braun: the ${mode} mode row failed: ${String(err)}`)
+  }
+}
+
 /** The handoff tool called from a subagent: only the delegated Braun, handing back, and only to prepare its commit. */
 async function delegatedHandBack($: EngineInterface, agentId: string, to: Role, commit: unknown) {
   const run = await delegatedRun($, agentId)
@@ -361,7 +391,7 @@ export const register: Register = (on, options) => {
   const model = pick(options.braunModel, MODELS)
   const effort = pick(options.braunEffort, EFFORTS)
 
-  // The role texts the prompt.compose hook adds, read at session start; a role whose text failed to read adds nothing.
+  // The role texts of the mode rows, read at session start; a role whose text failed to read gets its row without text.
   const rolePrompt: Partial<Record<Role, string>> = {}
 
   on('session.start', async ($, e, next) => {
@@ -458,7 +488,7 @@ export const register: Register = (on, options) => {
         rolePrompt[role] = await $.fs.read(`${$.plugin.root}/prompts/${file}`)
       } catch (err) {
         delete rolePrompt[role]
-        $.ui.toast(`pauli-braun: reading prompts/${file} failed, so ${NAME[role]} mode adds no prompt: ${String(err)}`)
+        $.ui.toast(`pauli-braun: reading prompts/${file} failed, so the ${NAME[role]} row has no text: ${String(err)}`)
       }
     }
     try {
@@ -481,18 +511,17 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // The mode is the session's own: its role text is added to the system prompt, after every shared section.
-  on('prompt.compose', async ($, e, next) => {
-    const r = await next(e)
-    const mode = await currentMode($)
-    const text = mode === 'off' ? undefined : rolePrompt[mode]
-    if (text === undefined) return r
-    return { sections: [...r.sections, { id: 'pauli-braun:mode', text, scope: 'session' }] }
-  })
-
   on('turn.start', async ($, e, next) => {
     await $.state.set(HANDED_OFF, false)
     await update($, ARMED, armed => (armed !== undefined && armed !== null && !armed.started ? { ...armed, started: true } : armed ?? null))
+    // The role row is appended again every few main-loop turns, so that compaction cannot lose it for long.
+    if (e.agentId === undefined) {
+      const { value } = await $.state.get(ROW_AGE)
+      const age = (value ?? 0) + 1
+      await $.state.set(ROW_AGE, age)
+      const mode = await currentMode($)
+      if (mode !== 'off' && age >= REFRESH_TURNS) await announceMode($, mode, rolePrompt)
+    }
     return next(e)
   })
 
@@ -504,6 +533,15 @@ export const register: Register = (on, options) => {
       if (armed?.started === true) await $.state.set(ARMED, null)
       const { value: delegation } = await $.state.get(DELEGATION)
       if (delegation !== undefined && delegation !== null && delegation.agentId === null) await $.state.set(DELEGATION, null)
+      // Braun always hands back: an answer that ends the turn without the hand-off is sent back once to write the report.
+      if (e.reason === 'answer' && (await currentMode($)) === 'braun' && (await $.state.get(HANDED_OFF)).value !== true) {
+        if ((await $.state.get(NUDGED)).value !== true) {
+          await $.state.set(NUDGED, true)
+          await $.prompt.submit({ text: NUDGE })
+        } else {
+          $.ui.toast('pauli-braun: Braun ended again without handing back; ask it to report, or /pauli to take over.')
+        }
+      }
     } else {
       await update($, DELEGATION, delegation => (delegation?.agentId === e.agentId ? null : delegation ?? null))
     }
@@ -580,9 +618,11 @@ export const register: Register = (on, options) => {
     const allowed = run === undefined ? '' : allowances(run.allow, 'Allowed beyond the defaults for this run')
 
     await $.state.set(HANDED_OFF, true)
+    await $.state.set(NUDGED, false)
     later($, `the hand-off to ${NAME[to]}`, async () => {
       await applyMode($, to)
       if (run !== undefined) await $.state.set(RUN, run)
+      await announceMode($, to, rolePrompt)
       // After the switch, so Braun's still-running turn never sees it; before the kickoff, so Pauli does.
       const appended = report !== undefined && (await deliverReport($, report))
       await $.prompt.submit({ text: appended ? KICKOFF_GUARDED : KICKOFF[to] })
@@ -622,12 +662,18 @@ export const register: Register = (on, options) => {
 
   // Short commands. Each schedules its slash command for when the session is idle, never awaiting it here.
   on('command.run', { command: 'pauli' }, async $ => {
-    later($, 'switching to Pauli', () => applyMode($, 'pauli'))
+    later($, 'switching to Pauli', async () => {
+      await applyMode($, 'pauli')
+      await announceMode($, 'pauli', rolePrompt)
+    })
     return { text: 'Switching to Pauli mode.' }
   })
 
   on('command.run', { command: 'pb-off' }, async $ => {
-    later($, 'leaving Pauli/Braun mode', () => applyMode($, 'off'))
+    later($, 'leaving Pauli/Braun mode', async () => {
+      await applyMode($, 'off')
+      await announceMode($, 'off', rolePrompt)
+    })
     return { text: 'Leaving Pauli/Braun mode.' }
   })
 
@@ -715,20 +761,4 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) =>
     next.called ? next(e) : { deny: 'pauli-braun: its guard failed, so the call was refused.' },
   )
-
-  // Braun always hands back: a turn that ends without the hand-off is sent back once to write the report.
-  on('classic.Stop', async ($, e, next) => {
-    if (e.stop_hook_active || (await currentMode($)) !== 'braun') return next(e)
-    const { value: handedOff } = await $.state.get(HANDED_OFF)
-    if (handedOff === true) return next(e)
-    const result = await next(e)
-    return result.block !== undefined
-      ? result
-      : {
-          ...result,
-          block:
-            'You are Braun and this turn is ending without a hand-back. Invoke the pauli-braun:report skill now: ' +
-            'write your report (done or blocked) and hand the session back to Pauli.',
-        }
-  })
 }

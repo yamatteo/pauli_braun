@@ -7,8 +7,8 @@ A Claude Code plugin for a two-role workflow inside **one session thread**:
   changes code. It never touches version control itself: when its work is done, the plugin stages it and prepares
   the commit message for you.
 
-Each role is a section of the system prompt that the plugin adds per session, and the active mode shows on the
-status line. Every new session starts outside Pauli/Braun mode; you start it with `/pauli`. Two sessions in the same
+The role is a conversation row that the plugin adds when the mode changes, and again every 10 turns, not a section
+of the system prompt; the active mode shows on the status line. Every new session starts outside Pauli/Braun mode; you start it with `/pauli`. Two sessions in the same
 folder are independent: one can be in Pauli while the other stays in the default style. Hooks
 guard what each role may do, and skills carry the hand-offs. There is no plan file: the conversation is the
 record. When you trust Braun with a piece of work, `/delegate` runs it in a Braun subagent instead, so its effort
@@ -231,8 +231,14 @@ Free text: what the guard checks.
     name, but the contents of a tree (`cp -r`, `rsync dir/`) aren't checked file by file.
 - A guard sees only the matched files' staged diff and contents, and has no tools: it cannot read the rest of the
   repository or run anything.
-- Every Braun turn ends with a report and a hand-back to Pauli: a turn that ends without one is sent back once to
-  write it.
+- Every Braun turn ends with a report and a hand-back to Pauli: when a Braun turn ends with an answer and no
+  hand-off, the plugin (on `turn.complete`) submits a prompt asking for the report, once; if Braun ends again
+  without handing back, it only shows a toast.
+- The role text sits in the conversation as a user row, so it carries less weight than a system prompt, and
+  compaction can summarize it away until the next refresh (every 10 turns).
+- Organizations whose built-in policy plugin is seated outermost (e.g. Team) bypass user plugins' `prompt.compose`
+  and `classic.*` hooks, which is why this plugin uses neither. To check, run `claude --debug` and grep the log
+  for `bypassed`.
 - A delegated Braun:
   - **Relative paths** resolve from the session's directory: a `cd` the subagent ran in an earlier command isn't
     seen (one earlier on the same command line is).

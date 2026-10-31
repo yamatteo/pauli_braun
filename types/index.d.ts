@@ -58,6 +58,10 @@ declare module 'claude-code' {
       delegation: Delegation | null
       /** What /handoff or /delegate unlocked; null when nothing. */
       armed: Armed | null
+      /** Main-loop turns since the last role row. */
+      rowAge: number
+      /** Whether Braun has already been sent back, this run, to write its report. */
+      nudged: boolean
     }
   }
 }

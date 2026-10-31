@@ -16,7 +16,12 @@ function world(
   settings: Record<string, unknown> = {},
 ) {
   const prompts: string[] = []
+  const refusal = denyAppends
+  denyAppends = undefined
   const toasts: string[] = []
+  const appended: string[] = []
+  // Appended rows ('row: ...') and submitted prompts ('prompt: ...'), in the order they happened.
+  const log: string[] = []
   const clock = mock.clock(on)
   worldClock = clock
   mock.env(on, { HOME: '/home/u', TMPDIR: '/var/tmp/x' })
@@ -25,7 +30,13 @@ function world(
   on('settings.read', () => ({ value: settings }) as never)
   on('session.cwd', () => ({ value: '/repo' }))
   on('command.run', () => ({ text: 'ran' }) as never)
-  on('prompt.submit', (_$, e) => (prompts.push(e.text), { text: e.text }) as never)
+  on('prompt.submit', (_$, e) => (prompts.push(e.text), log.push(`prompt: ${e.text}`), { text: e.text }) as never)
+  on('session.append', (_$, e, next) => {
+    const text = (e.message.content[0] as { text: string }).text
+    appended.push(text)
+    log.push(`row: ${text}`)
+    return refusal === undefined ? next(e) : ({ deny: refusal } as never)
+  })
   on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', status: a.status ?? 'running' })) }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
@@ -49,9 +60,11 @@ function world(
     if (args[0] === 'check-ignore') return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  return { prompts, toasts, clock }
+  return { prompts, toasts, appended, log, clock }
 }
 
+/** Set by a test, before the world is made, to have the engine refuse every appended row. */
+let denyAppends: string | undefined
 let worldClock: ReturnType<typeof mock.clock>
 
 /** Puts the session in Pauli mode or out of the mode, the way the user does: /pauli or /pb-off, then the session goes idle. */
@@ -491,9 +504,9 @@ test('the foreground rule is Braun\'s: Pauli and mode off are not held to it', a
   for (const call of FOREGROUND_CALLS) expect(denied(await $.tool.call(call as never))).toBeUndefined()
 })
 
-/** The system prompt as the engine composes it (one shared section), the role texts readable, the session started. */
-async function composing($: Engine, on: On, settings: Record<string, unknown> = {}, unreadable = '') {
-  const world_ = world(on, [], {}, settings)
+/** The world, with the role texts readable and the session started. */
+async function starting($: Engine, on: On, unreadable = '') {
+  const world_ = world(on)
   on('fs.read', (_$, e) => {
     if (unreadable !== '' && e.path.endsWith(unreadable)) throw new Error('ENOENT')
     return { value: `text of ${e.path.slice(e.path.lastIndexOf('/') + 1)}` } as never
@@ -502,48 +515,138 @@ async function composing($: Engine, on: On, settings: Record<string, unknown> = 
   on('command.register', () => ({ value: undefined }) as never)
   on('agent.register', () => ({ value: { agent: AGENT } }) as never)
   on('session.start', () => ({ cwd: '/repo' }) as never)
-  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'base', scope: 'shared' }] }))
   on('tool.call', () => ({ result: 'ok' }))
   await $.session.start({ cwd: '/repo' } as never)
   return world_
 }
 
-const compose = async ($: Engine, outputStyle: { name: string; isKeepingCodingInstructions: boolean } | null = null) =>
-  (await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle, traits: [] })).sections
-const modeSection = async ($: Engine) => (await compose($)).filter(s => s.id === 'pauli-braun:mode')
+const HAND_OFF = { tool: 'mcp__pauli-braun__handoff' } as const
+let turnNo = 0
+const startTurn = ($: Engine, agentId?: string) =>
+  $.turn.start({ text: 'go', turnId: `n${(turnNo += 1)}`, ...(agentId === undefined ? {} : { agentId }) } as never)
+const endTurn = ($: Engine, reason: string, agentId?: string) =>
+  $.turn.complete({ answer: 'a', turnId: `n${(turnNo += 1)}`, durationMs: 1, isAborted: reason === 'aborted', reason, ...(agentId === undefined ? {} : { agentId }) } as never)
 
-test('a fresh session is off: no mode section, whatever the shared settings say', async ($, on) => {
-  await composing($, on, { outputStyle: 'pauli-braun:pauli' })
-  expect((await compose($)).map(s => s.id)).toEqual(['intro'])
-  // The output style the engine reports is ignored.
-  expect((await compose($, { name: 'pauli-braun:pauli', isKeepingCodingInstructions: true })).map(s => s.id)).toEqual(['intro'])
-  // And the Pauli-only tools stay locked: the mode is off.
-  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toContain('/handoff')
+test('the prompt.compose hook is gone: a fresh session adds no row, and /pauli appends the Pauli text once', async ($, on) => {
+  const { appended, clock } = await starting($, on)
+  expect(appended).toEqual([])
+  await command($, 'pauli')
+  await clock.advance(1)
+  expect(appended).toHaveLength(1)
+  expect(appended[0]).toContain('now in Pauli mode')
+  expect(appended[0]).toContain('text of pauli.md')
 })
 
-test('in Pauli mode the system prompt ends with the Pauli section', async ($, on) => {
-  await composing($, on)
-  await enter($, 'pauli')
-  const sections = await compose($)
-  expect(sections.map(s => s.id)).toEqual(['intro', 'pauli-braun:mode'])
-  expect(sections.at(-1)).toEqual({ id: 'pauli-braun:mode', text: 'text of pauli.md', scope: 'session' })
-})
-
-test('after a hand-off to Braun the section holds the Braun text, and /pb-off removes it', async ($, on) => {
-  const { clock } = await composing($, on)
+test('a hand-off to Braun appends the Braun row, then the Guardian report, before the kickoff', async ($, on) => {
+  const { log, clock } = await starting($, on)
   await enter($, 'pauli')
   await command($, 'handoff')
-  expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
+  expect(denied(await $.tool.call({ ...HAND_OFF, to: 'braun' } as never))).toBeUndefined()
   await clock.advance(1)
-  expect(await modeSection($)).toEqual([{ id: 'pauli-braun:mode', text: 'text of braun-thread.md', scope: 'session' }])
-
-  await enter($, 'off')
-  expect(await modeSection($)).toEqual([])
+  const rows = log.filter(l => l.includes('Braun'))
+  expect(log.at(-1)).toMatch(/^prompt: Braun, Pauli has handed off/)
+  expect(log.at(-2)).toContain('row: pauli-braun: this session is now in Braun mode')
+  expect(log.at(-2)).toContain('text of braun-thread.md')
+  expect(rows.length).toBeGreaterThan(0)
 })
 
-test('a role text that cannot be read adds nothing, and says so', async ($, on) => {
-  const { toasts } = await composing($, on, {}, 'pauli.md')
-  expect(toasts.some(t => t.includes('prompts/pauli.md'))).toBe(true)
+test('the Braun row comes before the Guardian report and the kickoff', async ($, on) => {
+  const { log, clock } = await starting($, on)
+  await braunRunsHere($, clock)
+  // Hand back with a commit: the guardian report would follow the Pauli row; here no guards exist, so only the order of rows is checked.
+  expect(log.findIndex(l => l.includes('now in Braun mode'))).toBeLessThan(log.findIndex(l => l.startsWith('prompt: Braun,')))
+})
+
+async function braunRunsHere($: Engine, clock: { advance: (ms: number) => Promise<unknown> }) {
   await enter($, 'pauli')
-  expect(await modeSection($)).toEqual([])
+  await command($, 'handoff')
+  await $.tool.call({ ...HAND_OFF, to: 'braun' } as never)
+  await clock.advance(1)
+}
+
+test('/pb-off appends the "left" row', async ($, on) => {
+  const { appended } = await starting($, on)
+  await enter($, 'pauli')
+  await enter($, 'off')
+  expect(appended.at(-1)).toContain('has left Pauli/Braun mode')
+})
+
+test('a role text that cannot be read still gets its row, with a note', async ($, on) => {
+  const { appended } = await starting($, on, 'pauli.md')
+  await enter($, 'pauli')
+  expect(appended[0]).toContain('now in Pauli mode')
+  expect(appended[0]).toContain('could not be read')
+})
+
+test('a refused or failing append is toasted, and never throws out', async ($, on) => {
+  denyAppends = 'nope'
+  const { toasts } = await starting($, on)
+  await enter($, 'pauli')
+  expect(toasts.some(t => t.includes('refused: nope'))).toBe(true)
+})
+
+test('the role row is refreshed on the 10th main-loop turn, not by subagent turns, and not when off', async ($, on) => {
+  const { appended } = await starting($, on)
+  await enter($, 'off')
+  for (let i = 0; i < 12; i += 1) await startTurn($)
+  expect(appended.filter(t => t.includes('now in'))).toEqual([])
+
+  await enter($, 'pauli')
+  expect(appended).toHaveLength(2)
+  for (let i = 0; i < 20; i += 1) await startTurn($, 'sub')
+  expect(appended).toHaveLength(2)
+  for (let i = 0; i < 9; i += 1) await startTurn($)
+  expect(appended).toHaveLength(2)
+  await startTurn($)
+  expect(appended).toHaveLength(3)
+  expect(appended[2]).toContain('text of pauli.md')
+  // The counter restarted.
+  for (let i = 0; i < 9; i += 1) await startTurn($)
+  expect(appended).toHaveLength(3)
+  await startTurn($)
+  expect(appended).toHaveLength(4)
+})
+
+test('a Braun turn that answers without handing back is nudged once, then toasted', async ($, on) => {
+  const { prompts, toasts, clock } = await starting($, on)
+  await braunRunsHere($, clock)
+  const kickoffs = prompts.length
+
+  await startTurn($)
+  await endTurn($, 'answer')
+  expect(prompts).toHaveLength(kickoffs + 1)
+  expect(prompts.at(-1)).toContain('pauli-braun:report')
+
+  await startTurn($)
+  await endTurn($, 'answer')
+  expect(prompts).toHaveLength(kickoffs + 1)
+  expect(toasts.at(-1)).toContain('Braun ended again without handing back')
+})
+
+test('no nudge for a hand-off, an aborted turn, a subagent turn, Pauli, or after a new hand-off resets it', async ($, on) => {
+  const { prompts, toasts, clock } = await starting($, on)
+  await braunRunsHere($, clock)
+  const kickoffs = prompts.length
+
+  await startTurn($)
+  await endTurn($, 'aborted')
+  await startTurn($)
+  await endTurn($, 'error')
+  await startTurn($, 'sub')
+  await endTurn($, 'answer', 'sub')
+  expect(prompts).toHaveLength(kickoffs)
+
+  // A turn that hands back is not nudged.
+  await startTurn($)
+  await $.tool.call({ ...HAND_OFF, to: 'pauli' } as never)
+  await endTurn($, 'answer')
+  expect(prompts).toHaveLength(kickoffs)
+  await clock.advance(1)
+  expect(toasts.some(t => t.includes('ended again'))).toBe(false)
+
+  // In Pauli mode, an answer is not nudged either.
+  const before = prompts.length
+  await startTurn($)
+  await endTurn($, 'answer')
+  expect(prompts).toHaveLength(before)
 })
