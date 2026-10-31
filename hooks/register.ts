@@ -15,6 +15,7 @@ const DELEGATION = { plugin: 'pauli-braun', key: 'delegation' } as const
 const ARMED = { plugin: 'pauli-braun', key: 'armed' } as const
 const ROW_AGE = { plugin: 'pauli-braun', key: 'rowAge' } as const
 const NUDGED = { plugin: 'pauli-braun', key: 'nudged' } as const
+const PENDING = { plugin: 'pauli-braun', key: 'pending' } as const
 
 /** Main-loop turns after which the role row is appended again, against compaction. */
 const REFRESH_TURNS = 10
@@ -531,6 +532,26 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       const { value: armed } = await $.state.get(ARMED)
       if (armed?.started === true) await $.state.set(ARMED, null)
+      // The hand-off tool only records the switch; it happens here, so the role row opens a turn instead of joining this one.
+      const { value: pending } = await $.state.get(PENDING)
+      if (pending !== undefined && pending !== null) {
+        await $.state.set(PENDING, null)
+        const { to, run, report } = pending
+        if (e.reason === 'answer') {
+          try {
+            await applyMode($, to)
+            if (run !== undefined) await $.state.set(RUN, run)
+            await announceMode($, to, rolePrompt)
+            // After the switch, before the kickoff, so the new role sees the report.
+            const appended = report !== undefined && (await deliverReport($, report))
+            await $.prompt.submit({ text: appended ? KICKOFF_GUARDED : KICKOFF[to] })
+          } catch (err) {
+            $.ui.toast(`pauli-braun: the hand-off to ${NAME[to]} failed: ${String(err)}`)
+          }
+        } else {
+          $.ui.toast(`pauli-braun: hand-off to ${NAME[to]} cancelled: the turn ended without finishing.`)
+        }
+      }
       const { value: delegation } = await $.state.get(DELEGATION)
       if (delegation !== undefined && delegation !== null && delegation.agentId === null) await $.state.set(DELEGATION, null)
       // Braun always hands back: an answer that ends the turn without the hand-off is sent back once to write the report.
@@ -619,14 +640,7 @@ export const register: Register = (on, options) => {
 
     await $.state.set(HANDED_OFF, true)
     await $.state.set(NUDGED, false)
-    later($, `the hand-off to ${NAME[to]}`, async () => {
-      await applyMode($, to)
-      if (run !== undefined) await $.state.set(RUN, run)
-      await announceMode($, to, rolePrompt)
-      // After the switch, so Braun's still-running turn never sees it; before the kickoff, so Pauli does.
-      const appended = report !== undefined && (await deliverReport($, report))
-      await $.prompt.submit({ text: appended ? KICKOFF_GUARDED : KICKOFF[to] })
-    })
+    await $.state.set(PENDING, { to, run, report })
     return {
       result: `Hand-off to ${NAME[to]} scheduled: the session switches to ${NAME[to]} mode when this turn ends, ` +
         `and ${NAME[to]} starts on its own.${prepared}${allowed} End your turn now, with no further tool calls.`,

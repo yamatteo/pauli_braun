@@ -62,6 +62,8 @@ declare module 'claude-code' {
       rowAge: number
       /** Whether Braun has already been sent back, this run, to write its report. */
       nudged: boolean
+      /** A hand-off the tool recorded, to be carried out when the main loop's turn completes; null when none. */
+      pending: { to: 'pauli' | 'braun'; run?: Run; report?: string } | null
     }
   }
 }

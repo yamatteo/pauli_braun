@@ -123,7 +123,7 @@ test('the run is recorded only once the session has switched to Braun', async ($
   expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('Pauli does not edit')
 
   // The scheduled hand-off switches to Braun, records the run and submits the kickoff.
-  await clock.advance(1)
+  await endTurn($, 'answer')
   expect(prompts.some(p => p.startsWith('Braun, Pauli has handed off to you'))).toBe(true)
   expect(denied(await $.tool.call(WRITE_NEW as never))).toBeUndefined()
 
@@ -382,7 +382,7 @@ async function braunRuns($: Engine, on: On, clock: { advance: (ms: number) => Pr
   await enter($, 'pauli')
   await command($, 'handoff')
   expect(denied(await $.tool.call({ tool: 'mcp__pauli-braun__handoff', to: 'braun' } as never))).toBeUndefined()
-  await clock.advance(1)
+  await endTurn($, 'answer')
 }
 
 const LINKS = {
@@ -542,7 +542,7 @@ test('a hand-off to Braun appends the Braun row, then the Guardian report, befor
   await enter($, 'pauli')
   await command($, 'handoff')
   expect(denied(await $.tool.call({ ...HAND_OFF, to: 'braun' } as never))).toBeUndefined()
-  await clock.advance(1)
+  await endTurn($, 'answer')
   const rows = log.filter(l => l.includes('Braun'))
   expect(log.at(-1)).toMatch(/^prompt: Braun, Pauli has handed off/)
   expect(log.at(-2)).toContain('row: pauli-braun: this session is now in Braun mode')
@@ -561,7 +561,7 @@ async function braunRunsHere($: Engine, clock: { advance: (ms: number) => Promis
   await enter($, 'pauli')
   await command($, 'handoff')
   await $.tool.call({ ...HAND_OFF, to: 'braun' } as never)
-  await clock.advance(1)
+  await endTurn($, 'answer')
 }
 
 test('/pb-off appends the "left" row', async ($, on) => {
@@ -640,8 +640,10 @@ test('no nudge for a hand-off, an aborted turn, a subagent turn, Pauli, or after
   await startTurn($)
   await $.tool.call({ ...HAND_OFF, to: 'pauli' } as never)
   await endTurn($, 'answer')
-  expect(prompts).toHaveLength(kickoffs)
   await clock.advance(1)
+  // The hand-back's own turn.complete switches to Pauli and submits the kickoff, not a nudge.
+  expect(prompts).toHaveLength(kickoffs + 1)
+  expect(prompts.at(-1)).toMatch(/^Pauli/)
   expect(toasts.some(t => t.includes('ended again'))).toBe(false)
 
   // In Pauli mode, an answer is not nudged either.
@@ -649,4 +651,53 @@ test('no nudge for a hand-off, an aborted turn, a subagent turn, Pauli, or after
   await startTurn($)
   await endTurn($, 'answer')
   expect(prompts).toHaveLength(before)
+})
+
+test('the hand-off switches nothing until the turn completes', async ($, on) => {
+  const { log, toasts, clock } = await starting($, on)
+  await enter($, 'pauli')
+  await command($, 'handoff')
+  log.length = 0
+  await startTurn($)
+  expect(denied(await $.tool.call({ ...HAND_OFF, to: 'braun' } as never))).toBeUndefined()
+  await clock.advance(1)
+  expect(log).toEqual([])
+  expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('Pauli does not edit')
+
+  await endTurn($, 'answer')
+  expect(log).toHaveLength(2)
+  expect(log[0]).toContain('row: pauli-braun: this session is now in Braun mode')
+  expect(log[1]).toMatch(/^prompt: Braun, Pauli has handed off/)
+  expect(toasts.some(t => t.includes('cancelled'))).toBe(false)
+  expect(denied(await $.tool.call(WRITE_NEW as never))).toBeUndefined()
+})
+
+test('a hand-back puts the guardian report between the role row and the kickoff', async ($, on) => {
+  const { log, clock } = await starting($, on)
+  await braunRunsHere($, clock)
+  log.length = 0
+  await startTurn($)
+  await $.tool.call({ ...HAND_OFF, to: 'pauli' } as never)
+  expect(log).toEqual([])
+  await endTurn($, 'answer')
+  expect(log[0]).toContain('row: pauli-braun: this session is now in Pauli mode')
+  expect(log.at(-1)).toMatch(/^prompt: /)
+})
+
+test('a hand-off whose turn is aborted is dropped: no switch, a toast, and nothing later', async ($, on) => {
+  const { log, toasts, clock } = await starting($, on)
+  await enter($, 'pauli')
+  await command($, 'handoff')
+  log.length = 0
+  await startTurn($)
+  await $.tool.call({ ...HAND_OFF, to: 'braun' } as never)
+  await endTurn($, 'aborted')
+  await clock.advance(1)
+  expect(log).toEqual([])
+  expect(toasts.at(-1)).toContain('cancelled')
+  expect(denied(await $.tool.call(WRITE_NEW as never))).toContain('Pauli does not edit')
+
+  await startTurn($)
+  await endTurn($, 'answer')
+  expect(log).toEqual([])
 })
